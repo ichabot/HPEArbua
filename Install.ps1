@@ -36,7 +36,9 @@ try {
 
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
     Copy-Item -Path (Join-Path $src.FullName '*') -Destination $Path -Recurse -Force
-    Get-ChildItem -Path $Path -Recurse -File | Unblock-File
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows) {
+        Get-ChildItem -Path $Path -Recurse -File | Unblock-File
+    }
 
     Write-Host "Installiert/aktualisiert: $Path" -ForegroundColor Green
     Write-Host ''
