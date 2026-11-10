@@ -1,0 +1,16 @@
+# Kundendaten gehoeren nie ins Repository.
+# Falls ein Tool versehentlich im Repo-Ordner ausgefuehrt wird, landet nichts davon im Commit.
+backup/
+logs/
+*.log
+*.swi
+*.cli
+
+# Kunden-CSVs nur ausserhalb von examples/
+*.csv
+!**/examples/*.csv
+
+# Windows / Editor
+Thumbs.db
+desktop.ini
+.vscode/

@@ -1,0 +1,9 @@
+IP;Name;Typ;STP;Gruppe;Aktiv;Inventar;Rack
+10.0.10.10;SW-CORE-01;Core;4096;0;ja;INV-0001;Serverraum
+10.0.10.11;SW-CORE-02;Core;8192;0;ja;INV-0002;Serverraum
+10.0.10.21;SW-A-02;Access;16384;1;ja;INV-0012;Gebaeude-A
+10.0.10.20;SW-A-01;Access;16384;1;ja;INV-0011;Gebaeude-A
+10.0.10.22;SW-A-03;Access;16384;1;ja;INV-0013;Gebaeude-A
+10.0.10.31;SW-B-02;Access;16384;2;ja;INV-0022;Gebaeude-B
+10.0.10.30;SW-B-01;Access;16384;2;ja;INV-0021;Gebaeude-B
+10.0.10.32;SW-B-03;Access;16384;2;nein;;Gebaeude-B
