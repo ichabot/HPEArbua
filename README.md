@@ -54,6 +54,7 @@ Das Tool-Verzeichnis bleibt dadurch frei von Kundendaten und lässt sich jederze
 ```
 HPEArbua/
 ├── Install.ps1                 Download / Update der Tools
+├── LICENSE
 ├── README.md
 └── tools/
     └── CX-Wartung/
@@ -74,3 +75,7 @@ HPEArbua/
 ## Hinweis
 
 Die Tools greifen schreibend auf produktive Netzwerkgeräte zu und können Neustarts auslösen. Vor dem ersten Einsatz in einer Umgebung jede Phase mit `-DryRun` und dann mit `-Only <IP>` an einem einzelnen Switch testen. Nutzung auf eigene Verantwortung.
+
+## Lizenz
+
+MIT, siehe [LICENSE](LICENSE).
