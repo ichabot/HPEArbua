@@ -1,5 +1,7 @@
 # LLDP-Netzplan
 
+[← Zur Übersicht aller Tools](../../README.md)
+
 Fragt Switche per SNMP ab, liest deren LLDP-Nachbarn aus und erzeugt daraus einen Netzwerkplan: welcher Switch hängt über welchen Port an welchem anderen, mit welcher Geschwindigkeit und über welches Medium (z. B. `10G LWL`, `10G DAC`, `1G Kupfer`). Das Tool liest nur und ändert nichts an den Geräten.
 
 Zusätzlich wertet es die MAC-Tabellen der Switche aus: SNMP-Geräte ohne LLDP (Server, iDRAC, NAS, USV …) werden an ihrem Switch-Port eingezeichnet, und je Switch gibt es eine Zählung der aktiven Ports und der angeschlossenen Endgeräte.
@@ -8,27 +10,116 @@ Es arbeitet über die Standard-LLDP-MIB und ist damit herstellerunabhängig (Aru
 
 ![Beispielplan mit fiktiven Daten](examples/netzplan-beispiel.png)
 
+## Inhalt
+
+- [Voraussetzungen](#voraussetzungen)
+- [Ausführen](#ausführen)
+- [Beispiele](#beispiele)
+- [Parameter](#parameter)
+- [Ausgabe](#ausgabe)
+- [So liest man den Plan](#so-liest-man-den-plan)
+- [Geschwindigkeit und Medium](#geschwindigkeit-und-medium)
+- [Endgeräte und Portzählung](#endgeräte-und-portzählung)
+- [Was das Tool im Netz tut](#was-das-tool-im-netz-tut)
+- [Grenzen](#grenzen)
+- [Teststand](#teststand)
+
 ## Voraussetzungen
 
 - Windows PowerShell 5.1 oder PowerShell 7. Keine Module nötig, SNMP v2c/v1 ist im Skript selbst umgesetzt.
 - SNMP-Lesezugriff auf die Switche (UDP 161) vom Admin-PC aus
 - LLDP auf den Switchen aktiv
 
-## Schnellstart
+## Ausführen
+
+Das Skript läuft auf einem PC oder Server im Kundennetz, der die Management-IPs der Switche per SNMP erreicht. Es schreibt seine Ergebnisse in den aktuellen Ordner, deshalb zuerst einen Arbeitsordner für den Kunden anlegen.
+
+### Variante A: nur dieses Skript laden
+
+Der schnellste Weg, wenn auf dem Rechner sonst nichts installiert ist:
 
 ```powershell
-cd C:\Kunden\Musterfirma\Switches
+mkdir C:\Kunden\Musterfirma\Netzplan; cd C:\Kunden\Musterfirma\Netzplan
+irm https://raw.githubusercontent.com/ichabot/HPEArbua/main/tools/LLDP-Netzplan/Get-LldpTopology.ps1 -OutFile Get-LldpTopology.ps1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\Get-LldpTopology.ps1 192.168.10.0/24 -Name Musterfirma
+```
+
+1. Die erste Zeile legt den Arbeitsordner an und wechselt hinein.
+2. Die zweite lädt das Skript in diesen Ordner. Derselbe Befehl holt später auch eine neuere Fassung.
+3. Die dritte erlaubt Skripte für dieses eine PowerShell-Fenster.
+4. Die vierte startet den Lauf. `192.168.10.0/24` durch das Management-Netz der Switche oder die IP des Core-Switches ersetzen.
+
+### Variante B: aus den installierten Tools
+
+Wenn die Tools über [`Install.ps1`](../../README.md#installation-und-update) installiert sind:
+
+```powershell
+mkdir C:\Kunden\Musterfirma\Netzplan; cd C:\Kunden\Musterfirma\Netzplan
 & "$HOME\Tools\HPEArbua\tools\LLDP-Netzplan\Get-LldpTopology.ps1" 192.168.10.0/24 -Name Musterfirma
 ```
+
+Für kürzere Aufrufe einen Alias setzen:
+
+```powershell
+Set-Alias netzplan "$HOME\Tools\HPEArbua\tools\LLDP-Netzplan\Get-LldpTopology.ps1"
+netzplan 192.168.10.0/24 -Name Musterfirma
+```
+
+### Variante C: ohne Internet am Kunden-PC
+
+`Get-LldpTopology.ps1` ist eine einzelne Datei ohne Abhängigkeiten. Auf einem anderen Rechner laden, per USB-Stick oder Fernwartung in den Arbeitsordner kopieren, dann:
+
+```powershell
+cd C:\Kunden\Musterfirma\Netzplan
+Unblock-File .\Get-LldpTopology.ps1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\Get-LldpTopology.ps1 192.168.10.0/24 -Name Musterfirma
+```
+
+### Nach dem Lauf
+
+- `Musterfirma.html` per Doppelklick im Browser öffnen, das ist der Plan.
+- Die Konsole zeigt am Ende die Verbindungen zwischen den Switchen und die Zählung je Switch.
+- Alle Dateien sind unter [Ausgabe](#ausgabe) beschrieben.
+
+### Wenn kein Gerät antwortet
+
+| Ursache | Abhilfe |
+|---|---|
+| Andere Community als `public` | `-Community <name>` angeben, mehrere mit Komma |
+| SNMP nur von bestimmten Adressen erlaubt (ACL, Management-VLAN) | Skript von einem zugelassenen Rechner starten oder die Adresse am Switch freigeben |
+| Sehr altes Gerät | `-V1` probieren |
+| Gerät antwortet, zeigt aber 0 LLDP-Nachbarn | LLDP am Gerät prüfen |
+
+Beim ersten Einsatz in einer Umgebung mit einem einzelnen Switch beginnen:
+
+```powershell
+.\Get-LldpTopology.ps1 192.168.10.1 -NoCrawl
+```
+
+## Beispiele
 
 Als Ziel reicht ein Netz oder ein einzelner Core-Switch. Switche, die ein abgefragtes Gerät per LLDP als Nachbarn meldet, werden automatisch mit abgefragt, auch wenn sie in einem anderen Netz liegen.
 
 ```powershell
+# Ganzes Management-Netz absuchen
+.\Get-LldpTopology.ps1 192.168.10.0/24 -Name Musterfirma
+
 # Start am Core, zwei Communities probieren
-Get-LldpTopology.ps1 10.0.0.1 -Community public,kunde123 -Name Musterfirma
+.\Get-LldpTopology.ps1 10.0.0.1 -Community public,kunde123 -Name Musterfirma
+
+# Mehrere Netze und einzelne Adressen
+.\Get-LldpTopology.ps1 192.168.10.0/24,192.168.20.0/24,10.0.0.1 -Name Musterfirma
 
 # Nur die genannten Geräte, ohne Nachziehen der Nachbarn
-Get-LldpTopology.ps1 10.0.0.1,10.0.0.2 -NoCrawl
+.\Get-LldpTopology.ps1 10.0.0.1,10.0.0.2 -NoCrawl
+
+# Nur die LLDP-Topologie, ohne MAC-Tabellen (schneller)
+.\Get-LldpTopology.ps1 192.168.10.0/24 -NoMacTable
+
+# Ergebnis in einen anderen Ordner schreiben
+.\Get-LldpTopology.ps1 192.168.10.0/24 -Name Musterfirma -OutDir C:\Kunden\Musterfirma\Netzplan
 ```
 
 ## Parameter
@@ -123,6 +214,14 @@ Für die Portzählung heißt das: `PortsAktiv` kommt direkt aus dem Portstatus d
 
 Abgefragte SNMP-Geräte ohne LLDP-Verbindung bekommen im Plan eine gestrichelte Linie zu ihrem Port. Hängt so ein Gerät hinter einem Access Point oder einem nicht abgefragten Switch, führt die Linie dorthin.
 
+## Was das Tool im Netz tut
+
+- Es sendet ausschließlich SNMP-Leseanfragen (Get, GetNext, GetBulk). Ein schreibendes Set ist im Skript nicht enthalten. Konfiguration ändern, Geräte neu starten oder etwas löschen kann es damit nicht.
+- Beim Absuchen eines Netzes bekommt jede Adresse ein kleines UDP-Paket auf Port 161. Antwortende Geräte werden danach nach LLDP-, Interface- und MAC-Tabellen gefragt, wie es ein Monitoring-System auch tut.
+- Auf dem PC schreibt es nur die Ausgabedateien in den Arbeitsordner. Gleichnamige Dateien eines früheren Laufs werden überschrieben.
+- Ein IDS oder eine Firewall mit Scan-Erkennung kann das Absuchen eines ganzen Netzes melden. Wer das vermeiden will, gibt nur die IP des Core-Switches an.
+- Sehr alte oder einfache Geräte mit fehlerhaftem SNMP-Agent können auf Abfragen mit kurzzeitig erhöhter CPU-Last reagieren.
+
 ## Grenzen
 
 - Ohne LLDP keine Nachbarn. Geräte, die nur CDP sprechen, tauchen ohne Verbindungen auf.
@@ -135,6 +234,8 @@ Abgefragte SNMP-Geräte ohne LLDP-Verbindung bekommen im Plan eine gestrichelte 
 
 ## Teststand
 
-Die LLDP-Topologie lief einmal in einer echten Umgebung mit ArubaOS-Switch-Geräten. Alles Weitere (Geschwindigkeit/Medium, MAC-Tabellen) ist bisher nur gegen simulierte Switche unter PowerShell 7 getestet (v2c und v1): mit verschiedenen Port-Namensschemata, LAG, Ring, unmanaged Switch, WLAN-Clients und nicht abgefragten Switchen. Dort stimmt die Zuordnung aller MAC-Adressen mit dem Soll überein.
+- **Echte Hardware:** Topologie und Link-Typen liefen in einer Umgebung mit ArubaOS-Switch-Geräten und lieferten dort Angaben wie `10G DAC` und `10G LWL`.
+- **Simulation:** Alles, auch die MAC-Auswertung, ist unter PowerShell 7 gegen simulierte Switche getestet (v2c und v1): mit verschiedenen Port-Namensschemata, LAG, Ring, unmanaged Switch, WLAN-Clients und nicht abgefragten Switchen. Dort stimmt die Zuordnung aller MAC-Adressen mit dem Soll überein.
+- **Offen:** Die MAC-Zuordnung und die Portzählung sind an echter Hardware noch nicht gegen eine bekannte Belegung geprüft.
 
-Das gilt besonders für die Medium-Erkennung: Die OIDs stammen aus den MIB-Dateien, die Typbezeichnungen echter Transceiver (`SFP+SR`, `SFP+DAC3`, `1000SX` …) werden per Mustererkennung eingeordnet. Welche Texte ein bestimmter Switch tatsächlich liefert, zeigt die Spalte `Detail` in der Link-CSV.
+Die Medium-Erkennung ordnet die Typbezeichnungen der Transceiver (`SFP+SR`, `SFP+DAC3`, `1000SX` …) per Mustererkennung ein. Welche Texte ein bestimmter Switch tatsächlich liefert, zeigt die Spalte `Detail` in der Link-CSV.
