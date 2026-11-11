@@ -12,12 +12,17 @@
       3. Per LLDP gemeldete Nachbar-Switche automatisch mit abfragen (abschaltbar)
       4. Links zusammenfuehren (beide Seiten eines Links = ein Eintrag)
       5. Je Link Geschwindigkeit und Medium bestimmen (z. B. "10G LWL", "10G DAC", "1G Kupfer")
+      6. MAC-Tabellen der Switche auswerten: jede MAC-Adresse genau einem Switch-Port zuordnen,
+         SNMP-Geraete ohne LLDP (Server, NAS, USV ...) an ihren Port haengen, Ports und
+         Endgeraete je Switch zaehlen
 
     Ausgabe im Zielordner:
       <Name>.html          interaktiver Netzplan (im Browser oeffnen)
       <Name>.drawio        derselbe Plan zum Nachbearbeiten in draw.io / diagrams.net
       <Name>_links.csv     Switch A / Port A / Port B / Switch B
       <Name>_devices.csv   alle gefundenen Geraete
+      <Name>_switches.csv  je Switch: Ports gesamt/aktiv, Endgeraete (MAC-Adressen)
+      <Name>_endgeraete.csv  jede MAC-Adresse mit Switch, Port, IP und Name
 
 .PARAMETER Target
     IP-Adressen, Hostnamen oder Netze in CIDR-Schreibweise. Mehrere mit Komma.
@@ -31,6 +36,9 @@
 .PARAMETER IncludeEndpoints
     Access Points, Telefone und sonstige LLDP-Nachbarn auch in die draw.io-Datei aufnehmen.
     (Im HTML-Plan sind sie immer enthalten und dort ein-/ausblendbar.)
+
+.PARAMETER NoMacTable
+    MAC-Tabellen nicht auswerten (schneller, nur LLDP-Topologie).
 
 .PARAMETER V1
     SNMP v1 statt v2c verwenden (fuer sehr alte Geraete).
@@ -53,7 +61,8 @@ param(
     [int]$Port = 161,
     [switch]$V1,
     [switch]$NoCrawl,
-    [switch]$IncludeEndpoints
+    [switch]$IncludeEndpoints,
+    [switch]$NoMacTable
 )
 
 $ErrorActionPreference = 'Stop'
@@ -253,10 +262,14 @@ function Get-SnmpWalk([string]$Ip, [string]$Comm, [string]$Base) {
 }
 
 # Walk als Tabelle: OID-Rest hinter der Basis -> VarBind
+$script:WalkCache = @{}
 function Get-WalkTable([string]$Ip, [string]$Comm, [string]$Base) {
+    $ck = $Ip + '|' + $Base
+    if ($script:WalkCache.ContainsKey($ck)) { return $script:WalkCache[$ck] }
     $t = @{}
     $len = $Base.Length + 1
     foreach ($vb in (Get-SnmpWalk $Ip $Comm $Base)) { $t[$vb.Oid.Substring($len)] = $vb }
+    $script:WalkCache[$ck] = $t
     return $t
 }
 
@@ -373,11 +386,16 @@ function Get-PortLabel([int]$Subtype, [byte[]]$IdBytes, [string]$Desc) {
         if ($Desc) { $lbl = $Desc }
     }
     elseif ($id -match '^\d+$' -and $Desc -and $Desc -ne $id -and $Desc.Length -le 28) {
-        if ($Desc -match ('(^|\D)' + $id + '$')) { $lbl = $Desc } else { $lbl = "$Desc [$id]" }
+        # "F2" bei ID 162 oder "Gi1/0/9" bei ID 9 ist der Portname; Freitext bekommt die ID dazu
+        if ($Desc -match ('(^|\D)' + $id + '$') -or $Desc -notmatch '\s') { $lbl = $Desc } else { $lbl = "$Desc [$id]" }
     }
-    $lbl = $lbl -replace '^(Ten-?GigabitEthernet|TenGigE)', 'Te' -replace '^GigabitEthernet', 'Gi' -replace '^FastEthernet', 'Fa'
-    if ($lbl.Length -gt 40) { $lbl = $lbl.Substring(0, 39) + '~' }
-    return $lbl
+    return (Format-PortName $lbl)
+}
+
+function Format-PortName([string]$n) {
+    $n = $n -replace '^(Ten-?GigabitEthernet|TenGigE)', 'Te' -replace '^GigabitEthernet', 'Gi' -replace '^FastEthernet', 'Fa'
+    if ($n.Length -gt 40) { $n = $n.Substring(0, 39) + '~' }
+    return $n
 }
 
 function Get-NodeType([byte[]]$Caps, [bool]$Scanned) {
@@ -387,9 +405,11 @@ function Get-NodeType([byte[]]$Caps, [bool]$Scanned) {
     if ($c -band 0x10) { return 'ap' }
     if ($c -band 0x20) { return 'switch' }
     if ($c -band 0x08) { return 'router' }
-    if ($Scanned) { return 'switch' }
+    if ($Scanned) { return '' }
     return 'other'
 }
+
+function Test-Big($n) { return ($n.Type -eq 'switch' -or $n.Type -eq 'router') }
 
 function Get-SortKey([string]$s) {
     return [regex]::Replace($s, '\d+', { param($m) $m.Value.PadLeft(6, '0') })
@@ -508,7 +528,7 @@ function Format-Speed([long]$Mbps) {
 # und Transceiver-Typ (HPE ArubaOS-Switch und AOS-CX) holen
 function Get-PortDetails([string]$Ip, [string]$Comm, $Ports, [string[]]$Nums) {
     $res = @{}
-    foreach ($n in $Nums) { $res[$n] = @{ Speed = [long]0; Mau = 0; Xcvr = ''; XcvrHint = '' } }
+    foreach ($n in $Nums) { $res[$n] = @{ Speed = [long]0; Mau = 0; Xcvr = ''; XcvrHint = ''; IfIndex = '' } }
     if ($Nums.Count -eq 0) { return $res }
 
     # LLDP-Portnummer -> ifIndex: ueber Portnamen, sonst gilt Portnummer = ifIndex
@@ -534,7 +554,7 @@ function Get-PortDetails([string]$Ip, [string]$Comm, $Ports, [string[]]$Nums) {
         foreach ($tbl in $tables) { if ($tbl.ContainsKey($n)) { $ifIdx[$n] = $n; break } }
     }
     $numByIf = @{}
-    foreach ($n in $ifIdx.Keys) { $numByIf[$ifIdx[$n]] = $n }
+    foreach ($n in $ifIdx.Keys) { $numByIf[$ifIdx[$n]] = $n; $res[$n].IfIndex = [string]$ifIdx[$n] }
 
     # Geschwindigkeit: ifHighSpeed (Mbit/s), ersatzweise ifSpeed (bit/s)
     if ($numByIf.Count -gt 0) {
@@ -596,6 +616,97 @@ function Get-PortDetails([string]$Ip, [string]$Comm, $Ports, [string[]]$Nums) {
         }
     }
     return $res
+}
+
+# ---------------------------------------------------------------------------
+# MAC-Tabelle, Portstatus, eigene MACs und ARP eines Geraets
+# ---------------------------------------------------------------------------
+function Test-UnicastMac([string]$Mac) {
+    if ($Mac -eq '00:00:00:00:00:00') { return $false }
+    return (([Convert]::ToInt32($Mac.Substring(0, 2), 16) -band 1) -eq 0)
+}
+
+function Get-BridgeData([string]$Ip, [string]$Comm) {
+    $b = @{ OwnMacs = @{}; Arp = @{}; Fdb = @{}; AllMacs = @{}; Names = @{}; Lag = @{}; PhysTotal = 0; PhysUp = 0 }
+
+    # eigene MAC-Adressen (ifPhysAddress)
+    $pa = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.2.2.1.6'
+    foreach ($k in $pa.Keys) {
+        $x = $pa[$k].Bytes
+        if ($null -eq $x -or $x.Length -ne 6) { continue }
+        $m = ConvertTo-Hex $x
+        if (Test-UnicastMac $m) { $b.OwnMacs[$m] = $true }
+    }
+
+    # ARP-Tabelle (ipNetToMediaPhysAddress), Index: ifIndex.a.b.c.d
+    $arp = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.4.22.1.2'
+    foreach ($k in $arp.Keys) {
+        $x = $arp[$k].Bytes
+        $p = $k.Split('.')
+        if ($null -eq $x -or $x.Length -ne 6 -or $p.Count -lt 5) { continue }
+        $m = ConvertTo-Hex $x
+        if (Test-UnicastMac $m) { $b.Arp[$m] = ($p[($p.Count - 4)..($p.Count - 1)] -join '.') }
+    }
+
+    # MAC-Tabelle: Q-BRIDGE-MIB (alle VLANs), sonst BRIDGE-MIB
+    $fdb = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.17.7.1.2.2.1.2'
+    if ($fdb.Count -eq 0) { $fdb = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.17.4.3.1.2' }
+    if ($fdb.Count -eq 0) { return $b }
+
+    $bp = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.17.1.4.1.2'      # Bridge-Port -> ifIndex
+    foreach ($k in $fdb.Keys) {
+        $p = $k.Split('.')
+        if ($p.Count -lt 6) { continue }
+        $bport = [string](ConvertTo-UInt $fdb[$k].Bytes)
+        if ($bport -eq '0') { continue }
+        $mac = (($p[($p.Count - 6)..($p.Count - 1)] | ForEach-Object { ([int]$_).ToString('x2') }) -join ':')
+        if (-not (Test-UnicastMac $mac)) { continue }
+        $if = $bport
+        if ($bp.ContainsKey($bport)) { $if = [string](ConvertTo-UInt $bp[$bport].Bytes) }
+        if (-not $b.Fdb.ContainsKey($if)) { $b.Fdb[$if] = @{} }
+        $b.Fdb[$if][$mac] = $true
+        $b.AllMacs[$mac] = $true
+    }
+
+    # Portnamen und Portstatus
+    $names = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.31.1.1.1.1'
+    if ($names.Count -eq 0) { $names = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.2.2.1.2' }
+    foreach ($k in $names.Keys) { $b.Names[$k] = Format-PortName (ConvertTo-Text $names[$k].Bytes) }
+    $types = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.2.2.1.3'
+    $oper = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.2.2.1.8'
+    foreach ($k in $types.Keys) {
+        $t = [int](ConvertTo-UInt $types[$k].Bytes)
+        if ($t -ne 6 -and $t -ne 62 -and $t -ne 117) { continue }      # nur Ethernet-Ports
+        $b.PhysTotal++
+        if ($oper.ContainsKey($k) -and (ConvertTo-UInt $oper[$k].Bytes) -eq 1) { $b.PhysUp++ }
+    }
+
+    # LAG-Mitglied -> LAG-Interface: IEEE8023-LAG-MIB, zusaetzlich ifStackTable
+    $lag = Get-WalkTable $Ip $Comm '1.2.840.10006.300.43.1.2.1.1.13'
+    foreach ($k in $lag.Keys) {
+        $agg = [string](ConvertTo-UInt $lag[$k].Bytes)
+        if ($agg -ne '0' -and $agg -ne $k) { $b.Lag[$k] = $agg }
+    }
+    $stack = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.31.1.2.1.3'
+    foreach ($k in $stack.Keys) {
+        $p = $k.Split('.')
+        if ($p.Count -ne 2 -or $p[0] -eq '0' -or $p[1] -eq '0') { continue }
+        if ($b.Fdb.ContainsKey($p[0]) -and -not $b.Lag.ContainsKey($p[1])) { $b.Lag[$p[1]] = $p[0] }
+    }
+    return $b
+}
+
+function Get-LocalArp {
+    $out = @{}
+    $lines = @()
+    try { $lines = @(& arp -a 2>$null) } catch { }
+    foreach ($ln in $lines) {
+        if ([string]$ln -match '(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})') {
+            $m = ($Matches[2] -replace '-', ':').ToLower()
+            if (Test-UnicastMac $m) { $out[$m] = $Matches[1] }
+        }
+    }
+    return $out
 }
 
 function Expand-Target([string[]]$Items) {
@@ -739,7 +850,8 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
         $speed = [long]0
         $locMedia = Get-EndMedia '' '' 0 $true
         $pd = $det[$e.PortNum]
-        if ($pd) { $speed = $pd.Speed; $locMedia = Get-EndMedia $pd.XcvrHint $pd.Xcvr $pd.Mau $true }
+        $localIf = ''
+        if ($pd) { $speed = $pd.Speed; $localIf = $pd.IfIndex; $locMedia = Get-EndMedia $pd.XcvrHint $pd.Xcvr $pd.Mau $true }
         $remMau = 0
         if ($advMau.ContainsKey($k)) { $remMau = $advMau[$k] }
         $remMedia = Get-EndMedia '' '' $remMau $false
@@ -753,6 +865,7 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
                 PortKey      = $rPortKey
                 Descr        = $e.Desc
                 Type         = (Get-NodeType $rCaps $false)
+                LocalIfIndex = $localIf
                 Mgmt         = $e.Mgmt
                 Speed        = $speed
                 LocMedia     = $locMedia
@@ -760,13 +873,22 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
             })
     }
 
+    $bridge = $null
+    if (-not $NoMacTable) { $bridge = Get-BridgeData $Ip $comm }
+    # Typ: LLDP-Capabilities; ohne Angabe ist ein Geraet mit MAC-Tabelle ein Switch, sonst ein Host
+    $type = Get-NodeType $caps $true
+    if (-not $type) {
+        if (($bridge -and $bridge.Fdb.Count -gt 0) -or $neighbors.Count -gt 1) { $type = 'switch' } else { $type = 'host' }
+    }
+
     return [pscustomobject]@{
         Ip        = $Ip
         Key       = $key
         Name      = $devName
         Descr     = $devDesc
-        Type      = (Get-NodeType $caps $true)
+        Type      = $type
         Neighbors = $neighbors
+        Bridge    = $bridge
     }
 }
 
@@ -796,7 +918,9 @@ while ($queue.Count -gt 0) {
     $seenKeys[$dev.Key] = $ip
     [void]$devices.Add($dev)
     $hint = ''
-    if ($dev.Neighbors.Count -eq 0) { $hint = '  (LLDP aus oder keine LLDP-MIB?)' }
+    if ($dev.Bridge -and $dev.Bridge.Fdb.Count -gt 0) { $hint = ', {0,4} MACs' -f $dev.Bridge.AllMacs.Count }
+    elseif ($dev.Type -eq 'host') { $hint = '  (kein Switch)' }
+    elseif ($dev.Neighbors.Count -eq 0) { $hint = '  (LLDP aus oder keine LLDP-MIB?)' }
     Write-Host ("  {0,-15} {1,-28} {2,3} LLDP-Nachbarn{3}" -f $ip, $dev.Name, $dev.Neighbors.Count, $hint)
 
     if (-not $NoCrawl) {
@@ -815,9 +939,9 @@ while ($queue.Count -gt 0) {
         }
     }
 }
-$script:Udp.Close()
 
 if ($devices.Count -eq 0) {
+    $script:Udp.Close()
     Write-Warning 'Kein Geraet hat geantwortet. Community, SNMP-Freigabe (ACL/Management-VLAN) und Firewall pruefen, ggf. -V1 testen.'
     return
 }
@@ -881,14 +1005,181 @@ foreach ($d in $devices) {
             $links[$lk] = [pscustomobject]@{
                 AKey = $d.Key; AEnd = $ea; APort = $n.LocalPort; BKey = $rk; BEnd = $eb; BPort = $n.Port; Both = $false
                 Speed = $n.Speed; AMedia = $n.LocMedia; BMedia = $n.RemMedia
-                SpeedText = ''; Media = ''; MediaText = ''; Detail = ''; Label = ''
+                SpeedText = ''; Media = ''; MediaText = ''; Detail = ''; Label = ''; Via = 'lldp'
             }
         }
     }
 }
 
+# ---------------------------------------------------------------------------
+# Endgeraete ueber die MAC-Tabellen verorten
+# ---------------------------------------------------------------------------
+# Prinzip: Jede MAC-Adresse wird netzweit genau einem Switch-Port zugeordnet.
+#  - Ports, hinter denen laut LLDP ein abgefragter Switch haengt, sind Uplinks und scheiden aus.
+#  - Unter den uebrigen Sichtungen gewinnt der Port mit den wenigsten MAC-Adressen
+#    (am Anschlussport steht ein Geraet allein, auf Durchgangsports stehen viele).
+#  - Ist eine MAC nur auf Uplinks zu sehen, haengt sie hinter dem Switch am Ende der Kette.
+$endpoints = New-Object System.Collections.ArrayList
+$swStats = [ordered]@{}
+if (-not $NoMacTable) {
+    $bridges = @($devices | Where-Object { $_.Bridge -and $_.Bridge.Fdb.Count -gt 0 })
+    $bridgeByKey = @{}
+    foreach ($d in $bridges) { $bridgeByKey[$d.Key] = $d }
+    $macRx = '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+
+    # MAC -> Switch (eigene Adressen), MAC -> bekannter Knoten, MAC -> IP
+    $switchMac = @{}; $macNode = @{}; $macIp = @{}
+    foreach ($d in $devices) {
+        if (-not $d.Bridge) { continue }
+        foreach ($m in $d.Bridge.OwnMacs.Keys) {
+            if ($bridgeByKey.ContainsKey($d.Key)) { $switchMac[$m] = $d.Key } else { $macNode[$m] = $d.Key }
+        }
+        foreach ($m in $d.Bridge.Arp.Keys) { $macIp[$m] = $d.Bridge.Arp[$m] }
+    }
+    $localArp = Get-LocalArp
+    foreach ($m in $localArp.Keys) { if (-not $macIp.ContainsKey($m)) { $macIp[$m] = $localArp[$m] } }
+    foreach ($k in $bridgeByKey.Keys) { if ($k -match $macRx) { $switchMac[$k] = $k } }
+
+    # Uplinks (Nachbar ist abgefragter Switch) und sonstige LLDP-Nachbarn je Port
+    $hard = @{}; $nbrAt = @{}
+    foreach ($d in $devices) {
+        foreach ($n in $d.Neighbors) {
+            $rk = $n.Key
+            if ($alias.ContainsKey($rk)) { $rk = $alias[$rk] }
+            foreach ($m in @($n.Key, $n.PortKey)) {
+                if ($m -notmatch $macRx) { continue }
+                if ($bridgeByKey.ContainsKey($rk)) { $switchMac[$m] = $rk } elseif (-not $macNode.ContainsKey($m)) { $macNode[$m] = $rk }
+            }
+            if (-not $bridgeByKey.ContainsKey($d.Key) -or -not $n.LocalIfIndex) { continue }
+            $ifs = @($n.LocalIfIndex)
+            if ($d.Bridge.Lag.ContainsKey($n.LocalIfIndex)) { $ifs += $d.Bridge.Lag[$n.LocalIfIndex] }
+            foreach ($i in $ifs) {
+                $pk = $d.Key + '|' + $i
+                if ($bridgeByKey.ContainsKey($rk)) { $hard[$pk] = $rk } elseif (-not $nbrAt.ContainsKey($pk)) { $nbrAt[$pk] = $rk }
+            }
+        }
+    }
+
+    # Sichtungen je MAC und Anzahl MACs je Port (ohne die Adressen der Switche selbst)
+    $seen = @{}; $size = @{}
+    foreach ($d in $bridges) {
+        foreach ($i in $d.Bridge.Fdb.Keys) {
+            $pk = $d.Key + '|' + $i
+            $c = 0
+            foreach ($m in $d.Bridge.Fdb[$i].Keys) {
+                if ($switchMac.ContainsKey($m)) { continue }
+                $c++
+                if (-not $seen.ContainsKey($m)) { $seen[$m] = New-Object System.Collections.ArrayList }
+                [void]$seen[$m].Add($pk)
+            }
+            $size[$pk] = $c
+        }
+    }
+
+    # Zuordnung
+    $assign = @{}
+    foreach ($m in $seen.Keys) {
+        $best = $null; $bestUp = $null
+        foreach ($pk in $seen[$m]) {
+            if ($hard.ContainsKey($pk)) {
+                if (-not $bridgeByKey[$hard[$pk]].Bridge.AllMacs.ContainsKey($m)) {
+                    if ($null -eq $bestUp -or $size[$pk] -lt $size[$bestUp]) { $bestUp = $pk }
+                }
+            }
+            elseif ($null -eq $best -or $size[$pk] -lt $size[$best]) { $best = $pk }
+        }
+        if ($best) {
+            $cut = $best.LastIndexOf('|')
+            $assign[$m] = @{ Dev = $best.Substring(0, $cut); If = $best.Substring($cut + 1) }
+        }
+        elseif ($bestUp) { $assign[$m] = @{ Dev = $hard[$bestUp]; If = '' } }
+    }
+
+    # Liste der Endgeraete und Zaehler je Switch
+    foreach ($d in $bridges) {
+        $swStats[$d.Key] = [pscustomobject]@{ Key = $d.Key; Name = $d.Name; Ip = $d.Ip; PortsTotal = $d.Bridge.PhysTotal; PortsUp = $d.Bridge.PhysUp; Macs = 0; EdgePorts = 0; BehindAp = 0; Ports = @{} }
+    }
+    foreach ($m in $assign.Keys) {
+        $a = $assign[$m]
+        $d = $bridgeByKey[$a.Dev]
+        $st = $swStats[$a.Dev]
+        $st.Macs++
+        $portName = '?'; $note = 'Port unbekannt, MAC nur am Uplink zu diesem Switch gesehen'
+        if ($a.If) {
+            $pk = $a.Dev + '|' + $a.If
+            $st.Ports[$a.If] = $true
+            $portName = $d.Bridge.Names[$a.If]
+            if (-not $portName) { $portName = 'ifIndex ' + $a.If }
+            $note = ''
+            if ($nbrAt.ContainsKey($pk) -and $nodes.Contains($nbrAt[$pk])) {
+                $nbNode = $nodes[$nbrAt[$pk]]
+                if ($macNode[$m] -eq $nbNode.Key) { $note = 'LLDP-Nachbar' }
+                else {
+                    $note = 'hinter ' + $nbNode.Name
+                    if ($nbNode.Type -eq 'ap') { $st.BehindAp++; $note = 'WLAN, hinter ' + $nbNode.Name }
+                }
+            }
+            elseif ($size[$pk] -gt 2) { $note = '{0} MACs an diesem Port (unmanaged Switch, VM-Host, LAG?)' -f $size[$pk] }
+        }
+        $epName = ''; $epIp = ''
+        if ($macNode.ContainsKey($m) -and $nodes.Contains($macNode[$m])) { $epName = $nodes[$macNode[$m]].Name; $epIp = $nodes[$macNode[$m]].Ip }
+        if ($macIp.ContainsKey($m)) { $epIp = $macIp[$m] }
+        [void]$endpoints.Add([pscustomobject]@{ SwitchKey = $a.Dev; Switch = $d.Name; Port = $portName; Mac = $m; Ip = $epIp; Name = $epName; Hinweis = $note })
+    }
+    foreach ($st in $swStats.Values) { $st.EdgePorts = $st.Ports.Count }
+
+    # Abgefragte Geraete ohne LLDP-Verbindung an ihren Port haengen
+    $linked = @{}
+    foreach ($l in $links.Values) { $linked[$l.AKey] = $true; $linked[$l.BKey] = $true }
+    $none = Get-EndMedia '' '' 0 $true
+    foreach ($d in $devices) {
+        if (-not $d.Bridge -or $bridgeByKey.ContainsKey($d.Key) -or $linked.ContainsKey($d.Key)) { continue }
+        $cands = @($d.Bridge.OwnMacs.Keys)
+        foreach ($m in $macIp.Keys) { if ($macIp[$m] -eq $d.Ip) { $cands += $m } }
+        $hit = $null
+        foreach ($m in $cands) { if ($assign.ContainsKey($m)) { $hit = $m; break } }
+        if (-not $hit) { continue }
+        $a = $assign[$hit]
+        $from = $a.Dev; $fromPort = '?'; $speed = [long]0
+        if ($a.If) {
+            $pk = $a.Dev + '|' + $a.If
+            $sw = $bridgeByKey[$a.Dev]
+            $fromPort = $sw.Bridge.Names[$a.If]
+            if (-not $fromPort) { $fromPort = 'ifIndex ' + $a.If }
+            if ($nbrAt.ContainsKey($pk) -and $nodes.Contains($nbrAt[$pk]) -and $nbrAt[$pk] -ne $d.Key) {
+                # MAC liegt hinter einem LLDP-Nachbarn (AP, nicht abgefragter Switch, Router)
+                $from = $nbrAt[$pk]; $fromPort = ''
+                if ($nodes[$from].Type -eq 'ap') { $fromPort = 'WLAN' }
+            }
+            else {
+                $oid = '1.3.6.1.2.1.31.1.1.1.15.' + $a.If
+                $v = Get-SnmpValues $sw.Ip $known[$sw.Ip].Community @($oid)
+                if ($v.ContainsKey($oid)) { $speed = [long](ConvertTo-UInt $v[$oid].Bytes) }
+                if ($speed -le 0) {
+                    $oid = '1.3.6.1.2.1.2.2.1.5.' + $a.If
+                    $v = Get-SnmpValues $sw.Ip $known[$sw.Ip].Community @($oid)
+                    if ($v.ContainsKey($oid)) { $speed = [long][math]::Round((ConvertTo-UInt $v[$oid].Bytes) / 1000000) }
+                }
+            }
+        }
+        $links['mac|' + $d.Key] = [pscustomobject]@{
+            AKey = $from; AEnd = ''; APort = $fromPort; BKey = $d.Key; BEnd = ''; BPort = ''; Both = $false
+            Speed = $speed; AMedia = $none; BMedia = $none
+            SpeedText = ''; Media = ''; MediaText = ''; Detail = ''; Label = ''; Via = 'mac'
+        }
+    }
+}
+$script:Udp.Close()
+
 # Je Link: Geschwindigkeit und Medium aus beiden Enden zusammenfuehren
 foreach ($l in $links.Values) {
+    # Switch nach links: (AP, Switch) -> (Switch, AP)
+    if (-not (Test-Big $nodes[$l.AKey]) -and (Test-Big $nodes[$l.BKey])) {
+        $t = $l.AKey; $l.AKey = $l.BKey; $l.BKey = $t
+        $t = $l.APort; $l.APort = $l.BPort; $l.BPort = $t
+        $t = $l.AEnd; $l.AEnd = $l.BEnd; $l.BEnd = $t
+        $t = $l.AMedia; $l.AMedia = $l.BMedia; $l.BMedia = $t
+    }
     $m = $l.AMedia; $o = $l.BMedia
     if ($o.Rank -gt $m.Rank) { $m = $l.BMedia; $o = $l.AMedia }
     if ($l.Speed -le 0) { $l.Speed = $m.Speed }
@@ -915,14 +1206,15 @@ $linkList = @($links.Values | Sort-Object { Get-SortKey $nodes[$_.AKey].Name }, 
 # ---------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $OutDir)) { [void](New-Item -ItemType Directory -Path $OutDir) }
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
-$typeText = @{ switch = 'Switch'; router = 'Router/Firewall'; ap = 'Access Point'; phone = 'Telefon'; other = 'Sonstiges' }
+$typeText = @{ switch = 'Switch'; router = 'Router/Firewall'; ap = 'Access Point'; phone = 'Telefon'; host = 'Server/Geraet (SNMP)'; other = 'Sonstiges' }
 
 $linkRows = foreach ($l in $linkList) {
     $a = $nodes[$l.AKey]; $b = $nodes[$l.BKey]
     $src = 'eine Seite'
     if ($l.Both) { $src = 'beide Seiten' }
+    if ($l.Via -eq 'mac') { $src = 'MAC-Tabelle' }
     [pscustomobject]@{
-        GeraetA   = $a.Name; IpA = $a.Ip; PortA = $l.APort
+        GeraetA   = $a.Name; IpA = $a.Ip; TypA = $typeText[$a.Type]; PortA = $l.APort
         PortB     = $l.BPort; GeraetB = $b.Name; IpB = $b.Ip
         TypB      = $typeText[$b.Type]
         Link      = $l.Label; Geschwindigkeit = $l.SpeedText; Medium = $l.MediaText; Detail = $l.Detail
@@ -941,10 +1233,20 @@ if ($PSVersionTable.PSVersion.Major -ge 6) { $csvEnc = 'utf8BOM' }
 @($linkRows) | Export-Csv -LiteralPath $csvLinks -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
 @($devRows) | Export-Csv -LiteralPath $csvDevs -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
 
+$csvSw = Join-Path $OutDir ($Name + '_switches.csv')
+$csvEp = Join-Path $OutDir ($Name + '_endgeraete.csv')
+$swRows = @(foreach ($st in ($swStats.Values | Sort-Object { Get-SortKey $_.Name })) {
+        [pscustomobject]@{ Switch = $st.Name; Ip = $st.Ip; PortsGesamt = $st.PortsTotal; PortsAktiv = $st.PortsUp; PortsMitEndgeraet = $st.EdgePorts; Endgeraete = $st.Macs; DavonWLAN = $st.BehindAp }
+    })
+$epRows = @($endpoints | Sort-Object { Get-SortKey $_.Switch }, { Get-SortKey $_.Port }, Mac | Select-Object Switch, Port, Mac, Ip, Name, Hinweis)
+if (-not $NoMacTable) {
+    $swRows | Export-Csv -LiteralPath $csvSw -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
+    $epRows | Export-Csv -LiteralPath $csvEp -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
+}
+
 # ---------------------------------------------------------------------------
 # Ausgabe: draw.io
 # ---------------------------------------------------------------------------
-function Test-Big($n) { return ($n.Type -eq 'switch' -or $n.Type -eq 'router') }
 function Get-NodeSize($n) { if (Test-Big $n) { return @(200, 64) } else { return @(150, 40) } }
 
 function Get-TreeWidth([string]$Id, $Kids, $ById, $Width) {
@@ -993,12 +1295,12 @@ function Get-Layout($NodeSet, $LinkSet) {
 
 function ConvertTo-XmlText([string]$s) { return [System.Security.SecurityElement]::Escape($s) }
 
-$dNodes = @($nodeList | Where-Object { $IncludeEndpoints -or (Test-Big $_) })
+$dNodes = @($nodeList | Where-Object { $IncludeEndpoints -or (Test-Big $_) -or $_.Type -eq 'host' })
 $dIds = @{}
 foreach ($n in $dNodes) { $dIds[$n.Id] = $true }
 $dLinks = @(foreach ($l in $linkList) {
         $a = $nodes[$l.AKey].Id; $b = $nodes[$l.BKey].Id
-        if ($dIds.ContainsKey($a) -and $dIds.ContainsKey($b)) { [pscustomobject]@{ A = $a; B = $b; APort = $l.APort; BPort = $l.BPort; Label = $l.Label; Media = $l.Media; Speed = $l.Speed } }
+        if ($dIds.ContainsKey($a) -and $dIds.ContainsKey($b)) { [pscustomobject]@{ A = $a; B = $b; APort = $l.APort; BPort = $l.BPort; Label = $l.Label; Media = $l.Media; Speed = $l.Speed; Via = $l.Via } }
     })
 $pos = Get-Layout $dNodes $dLinks
 $styleByType = @{
@@ -1006,6 +1308,7 @@ $styleByType = @{
     router = 'fillColor=#e1d5e7;strokeColor=#9673a6;'
     ap     = 'fillColor=#d5e8d4;strokeColor=#82b366;'
     phone  = 'fillColor=#ffe6cc;strokeColor=#d79b00;'
+    host   = 'fillColor=#d0ece7;strokeColor=#0e8074;'
     other  = 'fillColor=#f5f5f5;strokeColor=#666666;'
 }
 $mediaColor = @{ lwl = '#e07c0c'; aoc = '#e07c0c'; dac = '#111827'; kupfer = '#4f7396'; sfp = '#8b5cf6'; bp = '#0f766e'; '' = '#9aa5b1' }
@@ -1032,6 +1335,7 @@ foreach ($l in $dLinks) {
     if ([string]::CompareOrdinal($l.A, $l.B) -le 0) { $pk = $l.A + '|' + $l.B; $p1 = $pos[$l.A]; $p2 = $pos[$l.B] } else { $pk = $l.B + '|' + $l.A; $p1 = $pos[$l.B]; $p2 = $pos[$l.A] }
     if ($pairIdx.ContainsKey($pk)) { $pairIdx[$pk]++ } else { $pairIdx[$pk] = 0 }
     $geo = '<mxGeometry relative="1" as="geometry"/>'
+    if ($l.Via -eq 'mac') { $style += 'dashed=1;' }
     $sw = 2
     if ($l.Speed -ge 25000) { $sw = 5 } elseif ($l.Speed -ge 10000) { $sw = 4 } elseif ($l.Speed -ge 2500) { $sw = 3 } elseif ($l.Speed -gt 0 -and $l.Speed -lt 1000) { $sw = 1 }
     $style = 'endArrow=none;html=1;rounded=0;fontSize=10;fontStyle=1;labelBackgroundColor=#ffffff;strokeWidth=' + $sw + ';strokeColor=' + $mediaColor[$l.Media] + ';fontColor=' + $mediaColor[$l.Media] + ';'
@@ -1070,12 +1374,17 @@ function ConvertTo-JsString([string]$s) {
 }
 $jNodes = foreach ($n in $nodeList) {
     $sc = 'false'; if ($n.Scanned) { $sc = 'true' }
-    '{"id":' + (ConvertTo-JsString $n.Id) + ',"name":' + (ConvertTo-JsString $n.Name) + ',"ip":' + (ConvertTo-JsString $n.Ip) + ',"descr":' + (ConvertTo-JsString $n.Descr) + ',"type":' + (ConvertTo-JsString $n.Type) + ',"scanned":' + $sc + '}'
+    $pt = ''; $mc = -1
+    if ($swStats.Contains($n.Key)) { $pt = '{0}/{1}' -f $swStats[$n.Key].PortsUp, $swStats[$n.Key].PortsTotal; $mc = $swStats[$n.Key].Macs }
+    '{"id":' + (ConvertTo-JsString $n.Id) + ',"name":' + (ConvertTo-JsString $n.Name) + ',"ip":' + (ConvertTo-JsString $n.Ip) + ',"descr":' + (ConvertTo-JsString $n.Descr) + ',"type":' + (ConvertTo-JsString $n.Type) + ',"scanned":' + $sc + ',"ports":' + (ConvertTo-JsString $pt) + ',"macs":' + $mc + '}'
 }
 $jLinks = foreach ($l in $linkList) {
-    '{"a":' + (ConvertTo-JsString $nodes[$l.AKey].Id) + ',"aPort":' + (ConvertTo-JsString $l.APort) + ',"b":' + (ConvertTo-JsString $nodes[$l.BKey].Id) + ',"bPort":' + (ConvertTo-JsString $l.BPort) + ',"speed":' + [long]$l.Speed + ',"media":' + (ConvertTo-JsString $l.Media) + ',"label":' + (ConvertTo-JsString $l.Label) + ',"detail":' + (ConvertTo-JsString $l.Detail) + '}'
+    '{"a":' + (ConvertTo-JsString $nodes[$l.AKey].Id) + ',"aPort":' + (ConvertTo-JsString $l.APort) + ',"b":' + (ConvertTo-JsString $nodes[$l.BKey].Id) + ',"bPort":' + (ConvertTo-JsString $l.BPort) + ',"speed":' + [long]$l.Speed + ',"media":' + (ConvertTo-JsString $l.Media) + ',"label":' + (ConvertTo-JsString $l.Label) + ',"detail":' + (ConvertTo-JsString $l.Detail) + ',"via":' + (ConvertTo-JsString $l.Via) + '}'
 }
-$json = '{"name":' + (ConvertTo-JsString $Name) + ',"generated":' + (ConvertTo-JsString (Get-Date -Format 'dd.MM.yyyy HH:mm')) + ',"nodes":[' + (@($jNodes) -join ',') + '],"links":[' + (@($jLinks) -join ',') + ']}'
+$jEps = foreach ($e in $endpoints) {
+    '{"sw":' + (ConvertTo-JsString $nodes[$e.SwitchKey].Id) + ',"port":' + (ConvertTo-JsString $e.Port) + ',"mac":' + (ConvertTo-JsString $e.Mac) + ',"ip":' + (ConvertTo-JsString $e.Ip) + ',"name":' + (ConvertTo-JsString $e.Name) + ',"note":' + (ConvertTo-JsString $e.Hinweis) + '}'
+}
+$json = '{"name":' + (ConvertTo-JsString $Name) + ',"generated":' + (ConvertTo-JsString (Get-Date -Format 'dd.MM.yyyy HH:mm')) + ',"nodes":[' + (@($jNodes) -join ',') + '],"links":[' + (@($jLinks) -join ',') + '],"endpoints":[' + (@($jEps) -join ',') + ']}'
 
 $template = @'
 <!DOCTYPE html>
@@ -1125,6 +1434,9 @@ th{text-align:left;color:#687888;font-weight:600;font-size:11px;text-transform:u
 td{padding:5px 6px;border-bottom:1px solid #edf0f4;vertical-align:top}
 td.p{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px;white-space:nowrap}
 td.n{white-space:nowrap}
+td.nt{color:#687888;font-size:11.5px}
+#side h3{font-size:13px;margin:20px 0 6px}
+table.ep tbody tr{cursor:default}
 tbody tr{cursor:pointer}
 tbody tr:hover{background:#f2f6fb}
 td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
@@ -1181,10 +1493,10 @@ td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6
 (function(){
 'use strict';
 const NS='http://www.w3.org/2000/svg';
-const TYPES={switch:['Switches','Switch','#1668c7'],router:['Router/Firewalls','Router/Firewall','#7b46d6'],ap:['Access Points','Access Point','#0c8a5f'],phone:['Telefone','Telefon','#c56a00'],other:['Sonstige','Sonstiges','#66727f']};
+const TYPES={switch:['Switches','Switch','#1668c7'],router:['Router','Router/Firewall','#7b46d6'],ap:['APs','Access Point','#0c8a5f'],phone:['Telefone','Telefon','#c56a00'],host:['Server/Ger\u00e4te','Server/Ger\u00e4t (SNMP)','#0e8074'],other:['Sonstige','Sonstiges','#66727f']};
 const MEDIA={lwl:['LWL (Glasfaser)','#e07c0c'],aoc:['AOC (aktives optisches Kabel)','#e07c0c'],dac:['DAC (Twinax)','#111827'],kupfer:['Kupfer (Twisted Pair)','#4f7396'],sfp:['SFP, Medium unbekannt','#8b5cf6'],bp:['Backplane','#0f766e'],'':['unbekannt','#9aa5b1']};
 const lw=function(s){return s>=25000?5:s>=10000?3.8:s>=2500?2.9:s>=1000?2.2:s>0?1.4:2;};
-const show={switch:true,router:true,ap:false,phone:false,other:false};
+const show={switch:true,router:true,ap:false,phone:false,host:true,other:false};
 const nodes=DATA.nodes,links=DATA.links,byId={};
 nodes.forEach(function(n){byId[n.id]=n;n.x=0;n.y=0;});
 const GAPX=44,GAPY=170,LSKEY='netzplan:'+DATA.name+':'+nodes.length+':'+links.length;
@@ -1201,7 +1513,10 @@ const cut=function(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'\u2026':s;};
 const nat=function(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'});};
 function S(tag,attrs,parent,text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!=null)e.textContent=text;if(parent)parent.appendChild(e);return e;}
 function H(tag,attrs,parent,text){const e=document.createElement(tag);for(const k in (attrs||{}))e.setAttribute(k,attrs[k]);if(text!=null)e.textContent=text;if(parent)parent.appendChild(e);return e;}
-const vis=function(n){return show[n.type];};
+let forced={};
+const vis=function(n){return show[n.type]||!!forced[n.id];};
+// Haengt ein sichtbares Geraet laut MAC-Tabelle an einem ausgeblendeten Knoten (z. B. WLAN-Drucker am AP), wird der mit angezeigt
+function recalcForced(){forced={};links.forEach(function(l){if(l.via==='mac'&&show[byId[l.b].type]&&!show[byId[l.a].type])forced[l.a]=true;});}
 const visLinks=function(){return links.filter(function(l){return vis(byId[l.a])&&vis(byId[l.b]);});};
 function neighbors(id){const s=new Set();links.forEach(function(l){if(l.a===id)s.add(l.b);if(l.b===id)s.add(l.a);});return s;}
 
@@ -1264,7 +1579,9 @@ function portLabel(p,q,text,cls){
 }
 function drawLink(l,an,mid){
   const hot=selected&&(l.a===selected||l.b===selected),cls=hot?' hot':(selected?' dim':''),m=MEDIA[l.media]||MEDIA[''];
-  S('line',{x1:an.a.x,y1:an.a.y,x2:an.b.x,y2:an.b.y,'class':'lk'+cls,stroke:m[1],'stroke-width':lw(l.speed)+(hot?1.2:0)},gL);
+  const la={x1:an.a.x,y1:an.a.y,x2:an.b.x,y2:an.b.y,'class':'lk'+cls,stroke:m[1],'stroke-width':lw(l.speed)+(hot?1.2:0)};
+  if(l.via==='mac')la['stroke-dasharray']='6 5';
+  S('line',la,gL);
   portLabel(an.a,an.b,l.aPort,cls);
   portLabel(an.b,an.a,l.bPort,cls);
   if(mid){
@@ -1285,7 +1602,7 @@ function drawNode(n,nb){
   if(isBig(n)){
     S('text',{'class':'nm',x:24,y:25},g,cut(n.name,Math.floor((s.w-36)/7.4)));
     S('text',{'class':'ip',x:24,y:41},g,n.ip||'keine IP gemeldet');
-    S('text',{'class':'ds',x:24,y:55},g,cut(n.descr,Math.floor((s.w-36)/5.3)));
+    S('text',{'class':'ds',x:24,y:55},g,cut(n.ports?n.ports+' Ports aktiv \u00b7 '+n.macs+' Endger\u00e4te':n.descr,Math.floor((s.w-36)/5.3)));
   }else{
     S('text',{'class':'nm sm',x:22,y:18},g,cut(n.name,19));
     S('text',{'class':'ip',x:22,y:32},g,n.ip||cut(n.descr,20));
@@ -1332,6 +1649,7 @@ function legend(){
   const used={};vl.forEach(function(l){used[l.media||'']=true;});
   ['lwl','aoc','dac','kupfer','sfp','bp',''].forEach(function(k){if(!used[k])return;const d=H('span',{},box),i=H('i',{},d);i.style.height='3px';i.style.background=MEDIA[k][1];d.appendChild(document.createTextNode(MEDIA[k][0]));});
   const steps=[[100,'bis 100M',0,1000],[1000,'1G',1000,2500],[2500,'2.5G / 5G',2500,10000],[10000,'10G',10000,25000],[25000,'ab 25G',25000,1e12]].filter(function(s){return vl.some(function(l){return l.speed>0&&l.speed>=s[2]&&l.speed<s[3];});});
+  if(vl.some(function(l){return l.via==='mac';})){const d=H('span',{},box),i=H('i',{},d);i.style.height='0';i.style.borderTop='2px dashed #5d6b78';i.style.borderRadius='0';d.appendChild(document.createTextNode('per MAC-Tabelle zugeordnet'));}
   if(steps.length&&box.childNodes.length)H('span',{'class':'sep'},box);
   steps.forEach(function(s){const d=H('span',{},box),e=H('i',{},d);e.style.height=lw(s[0])+'px';e.style.background='#5d6b78';d.appendChild(document.createTextNode(s[1]));});
   box.style.display=box.childNodes.length?'':'none';
@@ -1344,13 +1662,20 @@ function side(){
     H('button',{'class':'back'},box,'\u2190 alle Verbindungen').onclick=function(){select(null);};
     const hd=H('div',{'class':'hd'},box);const d=H('span',{'class':'dot'},hd);d.style.background=TYPES[n.type][2];H('h2',{},hd,n.name);
     const dl=H('dl',{},box);
-    [['IP',n.ip||'\u2013'],['Typ',TYPES[n.type][1]],['System',n.descr||'\u2013'],['Abfrage',n.scanned?'per SNMP ausgelesen':'nur per LLDP vom Nachbarn gemeldet']].forEach(function(r){H('dt',{},dl,r[0]);H('dd',{},dl,r[1]);});
+    [['IP',n.ip||'\u2013'],['Typ',TYPES[n.type][1]],['System',n.descr||'\u2013']].concat(n.ports?[['Ports',n.ports+' aktiv'],['Endger\u00e4te',n.macs+' MAC-Adressen an diesem Switch']]:[]).concat([['Abfrage',n.scanned?'per SNMP ausgelesen':'nur per LLDP vom Nachbarn gemeldet']]).forEach(function(r){H('dt',{},dl,r[0]);H('dd',{},dl,r[1]);});
     const rows=links.filter(function(l){return l.a===n.id||l.b===n.id;}).map(function(l){return l.a===n.id?{p:l.aPort,o:byId[l.b],op:l.bPort,l:l}:{p:l.bPort,o:byId[l.a],op:l.aPort,l:l};}).sort(function(a,b){return nat(a.p,b.p);});
     const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Port','Link','Nachbar','Nachbar-Port'].forEach(function(x){H('th',{},th,x);});
     const tb=H('tbody',{},t);
     rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);linkCell(tr,r.l);const c=H('td',{'class':'n'},tr);typeDot(c,r.o);c.appendChild(document.createTextNode(r.o.name));H('td',{'class':'p'},tr,r.op);
       tr.onclick=function(){if(!show[r.o.type]){show[r.o.type]=true;chips();relayout();}select(r.o.id);};});
     if(!rows.length)H('p',{'class':'hint'},box,'Keine LLDP-Nachbarn.');
+    const eps=(DATA.endpoints||[]).filter(function(e){return e.sw===n.id;}).sort(function(a,b){return nat(a.port,b.port)||nat(a.mac,b.mac);});
+    if(eps.length){
+      H('h3',{},box,'Endger\u00e4te laut MAC-Tabelle ('+eps.length+')');
+      const t2=H('table',{'class':'ep'},box),h2=H('tr',{},H('thead',{},t2));['Port','MAC','IP / Name','Hinweis'].forEach(function(x){H('th',{},h2,x);});
+      const b2=H('tbody',{},t2);
+      eps.forEach(function(e){const tr=H('tr',{},b2);H('td',{'class':'p'},tr,e.port);H('td',{'class':'p'},tr,e.mac);H('td',{},tr,[e.ip,e.name].filter(Boolean).join(' \u00b7 '));H('td',{'class':'nt'},tr,e.note);});
+    }
   }else{
     H('h2',{},box,'Verbindungen');
     H('p',{'class':'hint'},box,'Ger\u00e4t im Plan anklicken zeigt dessen Portbelegung. Knoten lassen sich verschieben.');
@@ -1378,7 +1703,7 @@ function chips(){
     b.onclick=function(){show[t]=!show[t];if(selected&&!vis(byId[selected]))selected=null;chips();relayout();side();};
   });
 }
-function relayout(){legend();layout();loadPos();render();fit();}
+function relayout(){recalcForced();legend();layout();loadPos();render();fit();}
 
 // --- Maus -----------------------------------------------------------------
 let drag=null;
@@ -1442,11 +1767,22 @@ $html = Join-Path $OutDir ($Name + '.html')
 # ---------------------------------------------------------------------------
 # Zusammenfassung
 # ---------------------------------------------------------------------------
-$swLinks = @($linkRows | Where-Object { $_.TypB -eq 'Switch' -or $_.TypB -eq 'Router/Firewall' })
+$bigText = @('Switch', 'Router/Firewall')
+$swLinks = @($linkRows | Where-Object { $bigText -contains $_.TypA -and $bigText -contains $_.TypB })
 Write-Host ''
 Write-Host ("{0} Geraete, {1} Verbindungen ({2} zwischen Switchen/Routern):" -f $nodeList.Count, $linkList.Count, $swLinks.Count)
 $swLinks | Format-Table GeraetA, PortA, Link, PortB, GeraetB, GemeldetVon -AutoSize | Out-String -Width 200 | Write-Host
+if ($swRows.Count -gt 0) {
+    Write-Host 'Ports und Endgeraete je Switch (jede MAC-Adresse zaehlt nur an ihrem Anschlussport):'
+    $swRows | Format-Table Switch, PortsAktiv, PortsGesamt, PortsMitEndgeraet, Endgeraete, DavonWLAN -AutoSize | Out-String -Width 200 | Write-Host
+    Write-Host ("Summe: {0} MAC-Adressen, davon {1} hinter Access Points." -f ($swRows | Measure-Object Endgeraete -Sum).Sum, ($swRows | Measure-Object DavonWLAN -Sum).Sum)
+    Write-Host ''
+}
 Write-Host "Netzplan:  $html"
 Write-Host "draw.io:   $drawio"
 Write-Host "CSV:       $csvLinks"
 Write-Host "           $csvDevs"
+if (-not $NoMacTable) {
+    Write-Host "           $csvSw"
+    Write-Host "           $csvEp"
+}

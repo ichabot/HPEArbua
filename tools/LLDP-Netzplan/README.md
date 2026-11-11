@@ -2,6 +2,8 @@
 
 Fragt Switche per SNMP ab, liest deren LLDP-Nachbarn aus und erzeugt daraus einen Netzwerkplan: welcher Switch hängt über welchen Port an welchem anderen, mit welcher Geschwindigkeit und über welches Medium (z. B. `10G LWL`, `10G DAC`, `1G Kupfer`). Das Tool liest nur und ändert nichts an den Geräten.
 
+Zusätzlich wertet es die MAC-Tabellen der Switche aus: SNMP-Geräte ohne LLDP (Server, iDRAC, NAS, USV …) werden an ihrem Switch-Port eingezeichnet, und je Switch gibt es eine Zählung der aktiven Ports und der angeschlossenen Endgeräte.
+
 Es arbeitet über die Standard-LLDP-MIB und ist damit herstellerunabhängig (Aruba CX, ArubaOS-Switch/ProCurve, Instant On, Cisco, Comware, Netgear …).
 
 ![Beispielplan mit fiktiven Daten](examples/netzplan-beispiel.png)
@@ -39,6 +41,7 @@ Get-LldpTopology.ps1 10.0.0.1,10.0.0.2 -NoCrawl
 | `-OutDir` | Zielordner für die Ausgabe | aktueller Ordner |
 | `-NoCrawl` | per LLDP gefundene Nachbar-Switche nicht automatisch abfragen | aus |
 | `-IncludeEndpoints` | Access Points, Telefone und sonstige Nachbarn auch in die draw.io-Datei aufnehmen | aus |
+| `-NoMacTable` | MAC-Tabellen nicht auswerten: schneller, dafür ohne Endgeräte-Zuordnung und Zählung | aus |
 | `-V1` | SNMP v1 statt v2c | aus |
 | `-TimeoutMs` / `-Retries` | Wartezeit je Anfrage und Anzahl Wiederholungen | `1500` / `1` |
 | `-Port` | SNMP-Port | `161` |
@@ -55,6 +58,8 @@ Alle Dateien landen im aktuellen Ordner bzw. in `-OutDir`:
 | `<Name>.drawio` | Derselbe Plan zum Nachbearbeiten in draw.io / diagrams.net |
 | `<Name>_links.csv` | Gerät A, Port A, Port B, Gerät B, Link-Typ (Geschwindigkeit, Medium, Detail wie `10GBASE-SR` oder `SFP+DAC3`) und ob beide Seiten den Link gemeldet haben |
 | `<Name>_devices.csv` | Alle gefundenen Geräte mit IP, Typ, Chassis-ID und Beschreibung |
+| `<Name>_switches.csv` | Je Switch: Ports gesamt, Ports aktiv, Ports mit Endgerät, Anzahl Endgeräte (MAC-Adressen), davon hinter Access Points |
+| `<Name>_endgeraete.csv` | Jede MAC-Adresse mit Switch, Port, IP, Name (soweit bekannt) und Hinweis |
 
 Die Ausgabe enthält Kundendaten und gehört in den Arbeitsordner des Kunden. Die `.gitignore` blockt `*.html`, `*.drawio` und `*.csv` im Repository.
 
@@ -63,6 +68,8 @@ Die Ausgabe enthält Kundendaten und gehört in den Arbeitsordner des Kunden. Di
 - Jede Linie ist ein LLDP-Nachbarschaftsverhältnis, die Beschriftung an den Enden nennt den Port auf der jeweiligen Seite.
 - In der Mitte der Linie steht der Link-Typ, z. B. `10G LWL`. Die Farbe zeigt das Medium, die Strichstärke die Geschwindigkeit; die Legende steht unter dem Plan.
 - Mehrere Linien zwischen zwei Geräten sind einzelne physische Links, typischerweise ein LAG. Sind sie gleichartig, tragen sie eine gemeinsame Beschriftung wie `2× 10G DAC`.
+- Gestrichelte Linien sind Zuordnungen aus der MAC-Tabelle, durchgezogene stammen aus LLDP.
+- Unter dem Namen eines Switches stehen aktive Ports und Endgeräte, z. B. `31/52 Ports aktiv · 87 Endgeräte`. Ein Klick auf den Switch listet die MAC-Adressen je Port.
 - Gestrichelte Geräte wurden von einem Nachbarn per LLDP gemeldet, haben selbst aber nicht auf SNMP geantwortet. Der Port auf deren Seite stammt dann aus der Meldung des Nachbarn.
 - Der Gerätetyp (Switch, Router/Firewall, Access Point, Telefon) kommt aus den LLDP-Capabilities.
 
@@ -92,15 +99,42 @@ Der Standard kennt für 10G-DAC in SFP+-Ports keinen eigenen MAU-Typ. `10G DAC` 
 
 Melden beide Enden gleich verlässlich unterschiedliche Medien (z. B. Medienkonverter), stehen beide im Plan: `1G LWL/Kupfer`.
 
+## Endgeräte und Portzählung
+
+Das Tool liest von jedem Switch die MAC-Tabelle (Q-BRIDGE-MIB, ersatzweise BRIDGE-MIB), den Portstatus, die eigenen MAC-Adressen und die ARP-Tabelle. Dazu kommt der ARP-Cache des PCs, auf dem das Skript läuft.
+
+Jede MAC-Adresse wird netzweit genau einem Switch-Port zugeordnet, damit nichts doppelt zählt:
+
+1. Ports, hinter denen laut LLDP ein abgefragter Switch hängt, sind Uplinks und scheiden aus. Das gilt auch für das zugehörige LAG-Interface.
+2. Unter den übrigen Ports, an denen die MAC zu sehen ist, gewinnt der mit den wenigsten MAC-Adressen. Am Anschlussport steht ein Gerät allein, auf Durchgangsports stehen viele.
+3. Ist eine MAC nur an Uplinks zu sehen, wird sie dem Switch am Ende der Kette zugeschrieben, mit Port `?`.
+4. Die MAC-Adressen der Switche selbst zählen nicht mit.
+
+Die Spalte `Hinweis` in der Endgeräte-Liste sagt, was an einem Port los ist:
+
+| Hinweis | Bedeutung |
+|---|---|
+| `LLDP-Nachbar` | das Gerät, das sich an diesem Port per LLDP meldet (AP, Telefon, Server) |
+| `WLAN, hinter <AP>` | WLAN-Client am Access Point dieses Ports |
+| `hinter <Gerät>` | hängt hinter einem LLDP-Nachbarn, z. B. PC am Telefon oder Gerät an einem nicht abgefragten Switch |
+| `n MACs an diesem Port` | mehrere Geräte ohne LLDP-Nachbar: unmanaged Switch, Host mit VMs oder ein LAG ohne LAG-MIB |
+
+Für die Portzählung heißt das: `PortsAktiv` kommt direkt aus dem Portstatus der Ethernet-Ports. `Endgeraete` zählt MAC-Adressen und liegt deshalb höher als die Zahl belegter Ports, sobald WLAN-Clients, VMs oder unmanaged Switche im Spiel sind. `PortsMitEndgeraet` und `DavonWLAN` helfen beim Einordnen.
+
+Abgefragte SNMP-Geräte ohne LLDP-Verbindung bekommen im Plan eine gestrichelte Linie zu ihrem Port. Hängt so ein Gerät hinter einem Access Point oder einem nicht abgefragten Switch, führt die Linie dorthin.
+
 ## Grenzen
 
 - Ohne LLDP keine Nachbarn. Geräte, die nur CDP sprechen, tauchen ohne Verbindungen auf.
 - SNMP v3 wird nicht unterstützt.
+- MAC-Tabellen sind eine Momentaufnahme. Geräte, die länger nichts gesendet haben, sind ausgealtert und fehlen in der Zählung.
+- Cisco IOS liefert die MAC-Tabelle per SNMP nur je VLAN (Community `name@vlan`). Abgefragt wird nur die Standard-Sicht; Geräte in anderen VLANs erscheinen dann am vorgelagerten Switch mit Port `?`.
+- Ein Gerät mit mehreren MAC-Adressen (Server mit mehreren NICs, VM-Host) zählt mehrfach.
 - Unmanaged Switche und Medienkonverter sind für LLDP unsichtbar. Hängen zwei Switche über so ein Gerät zusammen, zeigt der Plan sie als direkt verbunden.
 - Portnamen werden so übernommen, wie das Gerät sie per LLDP meldet. Lange Namen wie `GigabitEthernet1/0/1` werden zu `Gi1/0/1` gekürzt.
 
 ## Teststand
 
-Bisher gegen simulierte Switche mit verschiedenen Port-Namensschemata unter PowerShell 7 getestet (v2c und v1). Der Einsatz an echter Hardware und unter Windows PowerShell 5.1 steht noch aus.
+Die LLDP-Topologie lief einmal in einer echten Umgebung mit ArubaOS-Switch-Geräten. Alles Weitere (Geschwindigkeit/Medium, MAC-Tabellen) ist bisher nur gegen simulierte Switche unter PowerShell 7 getestet (v2c und v1): mit verschiedenen Port-Namensschemata, LAG, Ring, unmanaged Switch, WLAN-Clients und nicht abgefragten Switchen. Dort stimmt die Zuordnung aller MAC-Adressen mit dem Soll überein.
 
 Das gilt besonders für die Medium-Erkennung: Die OIDs stammen aus den MIB-Dateien, die Typbezeichnungen echter Transceiver (`SFP+SR`, `SFP+DAC3`, `1000SX` …) werden per Mustererkennung eingeordnet. Welche Texte ein bestimmter Switch tatsächlich liefert, zeigt die Spalte `Detail` in der Link-CSV.
