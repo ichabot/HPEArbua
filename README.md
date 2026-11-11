@@ -1,6 +1,6 @@
 # HPEArbua
 
-PowerShell-Werkzeuge für **HPE Aruba Networking CX** Switches (AOS-CX): Firmware-Updates in Wartungsfenstern, Backups und wiederkehrende Konfigurationsaufgaben über SSH.
+PowerShell-Werkzeuge für **HPE Aruba Networking CX** Switches (AOS-CX): Firmware-Updates in Wartungsfenstern, Backups und wiederkehrende Konfigurationsaufgaben über SSH. Dazu ein herstellerunabhängiger Netzwerkplan per SNMP/LLDP.
 
 Die Tools sind für den Einsatz in beliebigen Kundenumgebungen gebaut. Sie enthalten keine Umgebungsdaten. Alles Kundenspezifische (Switch-Liste, VLANs, Backups, Logs) liegt in einem eigenen Arbeitsordner pro Kunde.
 
@@ -9,6 +9,7 @@ Die Tools sind für den Einsatz in beliebigen Kundenumgebungen gebaut. Sie entha
 | Tool | Zweck |
 |---|---|
 | [CX-Wartung](tools/CX-Wartung/) | Firmware-Updates in Wellen mit Vorabprüfung, Backup, Hostname, Gateway/DNS/NTP, STP-Prioritäten, VLANs/Trunks, Banner, Inventar, Passwortwechsel |
+| [LLDP-Netzplan](tools/LLDP-Netzplan/) | Liest per SNMP die LLDP-Nachbarn aller Switche und erzeugt einen Netzwerkplan (HTML, draw.io, CSV) mit Port-zu-Port-Verbindungen. Nur lesend, herstellerunabhängig. |
 
 Weitere Tools folgen jeweils in einem eigenen Ordner unter `tools/`.
 
@@ -57,24 +58,28 @@ HPEArbua/
 ├── LICENSE
 ├── README.md
 └── tools/
-    └── CX-Wartung/
-        ├── CX-Wartung.ps1      das Tool
-        ├── New-CXWorkspace.ps1 Arbeitsordner für einen Kunden anlegen
-        ├── README.md           Doku zum Tool
-        └── examples/           Beispiel-CSVs mit fiktiven Daten
+    ├── CX-Wartung/
+    │   ├── CX-Wartung.ps1      das Tool
+    │   ├── New-CXWorkspace.ps1 Arbeitsordner für einen Kunden anlegen
+    │   ├── README.md           Doku zum Tool
+    │   └── examples/           Beispiel-CSVs mit fiktiven Daten
+    └── LLDP-Netzplan/
+        ├── Get-LldpTopology.ps1 das Tool
+        ├── README.md            Doku zum Tool
+        └── examples/            Beispielplan mit fiktiven Daten
 ```
 
 ## Regeln für neue Tools
 
 - Jedes Tool bekommt einen eigenen Ordner unter `tools/` mit eigener `README.md` und, wenn es Eingabedateien braucht, einem Ordner `examples/` mit fiktiven Daten.
-- Keine Kundendaten im Repository: keine echten IPs, Hostnamen, Seriennummern, Zugangsdaten. Die `.gitignore` blockt `backup/`, `logs/`, `*.csv` außerhalb von `examples/`, `*.swi` und `*.cli`.
+- Keine Kundendaten im Repository: keine echten IPs, Hostnamen, Seriennummern, Zugangsdaten. Die `.gitignore` blockt `backup/`, `logs/`, `*.csv` außerhalb von `examples/`, `*.swi`, `*.cli`, `*.html` und `*.drawio`.
 - Eingaben aus dem aktuellen Arbeitsordner lesen, Ausgaben dorthin schreiben.
 - Ändernde Aktionen: `-DryRun` anbieten, vor kritischen Schritten mit `JA` bestätigen lassen, bei Fehlern stoppen, Log schreiben.
 - Zugangsdaten nur abfragen (`Get-Credential`), nie speichern oder loggen.
 
 ## Hinweis
 
-Die Tools greifen schreibend auf produktive Netzwerkgeräte zu und können Neustarts auslösen. Vor dem ersten Einsatz in einer Umgebung jede Phase mit `-DryRun` und dann mit `-Only <IP>` an einem einzelnen Switch testen. Nutzung auf eigene Verantwortung.
+CX-Wartung greift schreibend auf produktive Netzwerkgeräte zu und kann Neustarts auslösen. Vor dem ersten Einsatz in einer Umgebung jede Phase mit `-DryRun` und dann mit `-Only <IP>` an einem einzelnen Switch testen. Nutzung auf eigene Verantwortung.
 
 ## Lizenz
 

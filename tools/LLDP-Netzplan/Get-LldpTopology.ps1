@@ -1,0 +1,1114 @@
+<#
+.SYNOPSIS
+    Fragt Switche per SNMP (LLDP-MIB) ab und baut daraus einen Netzwerkplan.
+
+.DESCRIPTION
+    Keine Module, keine Installation noetig - SNMP v2c/v1 ist direkt im Skript umgesetzt.
+    Laeuft unter Windows PowerShell 5.1 und PowerShell 7.
+
+    Ablauf:
+      1. Alle Zieladressen per SNMP anpingen (sysName/sysDescr)
+      2. Bei jedem antwortenden Geraet die LLDP-Tabellen auslesen
+      3. Per LLDP gemeldete Nachbar-Switche automatisch mit abfragen (abschaltbar)
+      4. Links zusammenfuehren (beide Seiten eines Links = ein Eintrag)
+
+    Ausgabe im Zielordner:
+      <Name>.html          interaktiver Netzplan (im Browser oeffnen)
+      <Name>.drawio        derselbe Plan zum Nachbearbeiten in draw.io / diagrams.net
+      <Name>_links.csv     Switch A / Port A / Port B / Switch B
+      <Name>_devices.csv   alle gefundenen Geraete
+
+.PARAMETER Target
+    IP-Adressen, Hostnamen oder Netze in CIDR-Schreibweise. Mehrere mit Komma.
+
+.PARAMETER Community
+    SNMP-Community. Mehrere werden der Reihe nach probiert. Standard: public
+
+.PARAMETER NoCrawl
+    Nur die angegebenen Ziele abfragen, per LLDP gefundene Nachbar-Switche nicht nachziehen.
+
+.PARAMETER IncludeEndpoints
+    Access Points, Telefone und sonstige LLDP-Nachbarn auch in die draw.io-Datei aufnehmen.
+    (Im HTML-Plan sind sie immer enthalten und dort ein-/ausblendbar.)
+
+.PARAMETER V1
+    SNMP v1 statt v2c verwenden (fuer sehr alte Geraete).
+
+.EXAMPLE
+    .\Get-LldpTopology.ps1 192.168.10.0/24
+
+.EXAMPLE
+    .\Get-LldpTopology.ps1 10.0.0.1 -Community public,kunde123 -Name Kunde-XY -OutDir C:\Temp
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [string[]]$Target,
+    [string[]]$Community = @('public'),
+    [string]$OutDir = (Get-Location).Path,
+    [string]$Name = 'netzplan',
+    [int]$TimeoutMs = 1500,
+    [int]$Retries = 1,
+    [int]$Port = 161,
+    [switch]$V1,
+    [switch]$NoCrawl,
+    [switch]$IncludeEndpoints
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# BER / SNMP
+# ---------------------------------------------------------------------------
+$script:SnmpVersion = 1
+if ($V1) { $script:SnmpVersion = 0 }
+$script:ReqId = Get-Random -Minimum 1000 -Maximum 1000000
+$script:NoBulk = @{}
+
+function ConvertTo-BerLength([int]$Len) {
+    if ($Len -lt 128) { return , ([byte[]]@($Len)) }
+    $b = New-Object 'System.Collections.Generic.List[byte]'
+    while ($Len -gt 0) { $b.Insert(0, [byte]($Len -band 0xFF)); $Len = $Len -shr 8 }
+    $b.Insert(0, [byte](0x80 -bor $b.Count))
+    return , $b.ToArray()
+}
+
+function New-Tlv([byte]$Tag, [byte[]]$Content) {
+    if ($null -eq $Content) { $Content = [byte[]]@() }
+    $l = New-Object 'System.Collections.Generic.List[byte]'
+    $l.Add($Tag)
+    $l.AddRange([byte[]](ConvertTo-BerLength $Content.Length))
+    $l.AddRange($Content)
+    return , $l.ToArray()
+}
+
+function ConvertTo-BerInt([long]$Value) {
+    $b = New-Object 'System.Collections.Generic.List[byte]'
+    $v = $Value
+    do { $b.Insert(0, [byte]($v -band 0xFF)); $v = $v -shr 8 } while ($v -gt 0)
+    if ($b[0] -band 0x80) { $b.Insert(0, [byte]0) }
+    return , (New-Tlv 0x02 $b.ToArray())
+}
+
+function ConvertTo-BerOid([string]$Oid) {
+    $p = @($Oid.Trim('.').Split('.') | ForEach-Object { [long]$_ })
+    $l = New-Object 'System.Collections.Generic.List[byte]'
+    $l.Add([byte](40 * $p[0] + $p[1]))
+    for ($i = 2; $i -lt $p.Count; $i++) {
+        $v = $p[$i]
+        $t = New-Object 'System.Collections.Generic.List[byte]'
+        $t.Add([byte]($v -band 0x7F)); $v = $v -shr 7
+        while ($v -gt 0) { $t.Insert(0, [byte](($v -band 0x7F) -bor 0x80)); $v = $v -shr 7 }
+        $l.AddRange($t)
+    }
+    return , (New-Tlv 0x06 $l.ToArray())
+}
+
+function New-SnmpRequest([byte]$PduType, [int]$ReqId, [string]$Comm, [string[]]$Oids, [int]$MaxRep) {
+    $vbs = New-Object 'System.Collections.Generic.List[byte]'
+    foreach ($o in $Oids) {
+        $vb = New-Object 'System.Collections.Generic.List[byte]'
+        $vb.AddRange([byte[]](ConvertTo-BerOid $o))
+        $vb.Add([byte]0x05); $vb.Add([byte]0x00)
+        $vbs.AddRange([byte[]](New-Tlv 0x30 $vb.ToArray()))
+    }
+    $pdu = New-Object 'System.Collections.Generic.List[byte]'
+    $pdu.AddRange([byte[]](ConvertTo-BerInt $ReqId))
+    $pdu.AddRange([byte[]](ConvertTo-BerInt 0))
+    $pdu.AddRange([byte[]](ConvertTo-BerInt $MaxRep))
+    $pdu.AddRange([byte[]](New-Tlv 0x30 $vbs.ToArray()))
+    $msg = New-Object 'System.Collections.Generic.List[byte]'
+    $msg.AddRange([byte[]](ConvertTo-BerInt $script:SnmpVersion))
+    $msg.AddRange([byte[]](New-Tlv 0x04 ([System.Text.Encoding]::ASCII.GetBytes($Comm))))
+    $msg.AddRange([byte[]](New-Tlv $PduType $pdu.ToArray()))
+    return , (New-Tlv 0x30 $msg.ToArray())
+}
+
+function Read-BerTlv([byte[]]$Buf, [int]$Pos) {
+    $tag = $Buf[$Pos]; $Pos++
+    $len = [int]$Buf[$Pos]; $Pos++
+    if ($len -band 0x80) {
+        $n = $len -band 0x7F; $len = 0
+        for ($i = 0; $i -lt $n; $i++) { $len = ($len -shl 8) -bor $Buf[$Pos]; $Pos++ }
+    }
+    if ($Pos + $len -gt $Buf.Length) { throw 'BER: Laenge ausserhalb des Pakets' }
+    return @{ Tag = $tag; Start = $Pos; Len = $len; Next = $Pos + $len }
+}
+
+function ConvertTo-Int([byte[]]$B) {
+    if ($null -eq $B -or $B.Length -eq 0) { return 0 }
+    [long]$v = 0
+    if ($B[0] -band 0x80) { $v = -1 }
+    foreach ($x in $B) { $v = ($v -shl 8) -bor $x }
+    return $v
+}
+
+function ConvertFrom-BerOid([byte[]]$Buf, [int]$Start, [int]$Len) {
+    if ($Len -lt 1) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    $first = [int]$Buf[$Start]
+    if ($first -lt 40) { [void]$sb.Append('0.').Append($first) }
+    elseif ($first -lt 80) { [void]$sb.Append('1.').Append($first - 40) }
+    else { [void]$sb.Append('2.').Append($first - 80) }
+    [long]$v = 0
+    for ($i = $Start + 1; $i -lt $Start + $Len; $i++) {
+        $b = $Buf[$i]
+        $v = ($v -shl 7) -bor ($b -band 0x7F)
+        if (-not ($b -band 0x80)) { [void]$sb.Append('.').Append($v); $v = 0 }
+    }
+    return $sb.ToString()
+}
+
+function ConvertFrom-SnmpResponse([byte[]]$Buf) {
+    $m = Read-BerTlv $Buf 0
+    $v = Read-BerTlv $Buf $m.Start
+    $c = Read-BerTlv $Buf $v.Next
+    $p = Read-BerTlv $Buf $c.Next
+    $r = Read-BerTlv $Buf $p.Start
+    $e = Read-BerTlv $Buf $r.Next
+    $x = Read-BerTlv $Buf $e.Next
+    $l = Read-BerTlv $Buf $x.Next
+    $rid = New-Object byte[] $r.Len; [Array]::Copy($Buf, $r.Start, $rid, 0, $r.Len)
+    $err = New-Object byte[] $e.Len; [Array]::Copy($Buf, $e.Start, $err, 0, $e.Len)
+    $vbs = New-Object System.Collections.ArrayList
+    $pos = $l.Start
+    while ($pos -lt $l.Next) {
+        $vb = Read-BerTlv $Buf $pos
+        $o = Read-BerTlv $Buf $vb.Start
+        $val = Read-BerTlv $Buf $o.Next
+        $bytes = New-Object byte[] $val.Len
+        if ($val.Len -gt 0) { [Array]::Copy($Buf, $val.Start, $bytes, 0, $val.Len) }
+        [void]$vbs.Add([pscustomobject]@{
+                Oid   = (ConvertFrom-BerOid $Buf $o.Start $o.Len)
+                Tag   = [int]$val.Tag
+                Bytes = $bytes
+            })
+        $pos = $vb.Next
+    }
+    return @{ PduType = [int]$p.Tag; ReqId = (ConvertTo-Int $rid); Error = (ConvertTo-Int $err); VarBinds = $vbs }
+}
+
+$script:Udp = New-Object System.Net.Sockets.UdpClient (New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0))
+$script:Udp.Client.ReceiveBufferSize = 1048576
+# Windows: ICMP "Port unreachable" darf den Socket nicht mit ConnectionReset stoeren
+try { [void]$script:Udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
+
+function Invoke-Snmp([string]$Ip, [string]$Comm, [int]$PduType, [string[]]$Oids, [int]$MaxRep) {
+    $script:ReqId = ($script:ReqId + 1) % 2000000000
+    $id = $script:ReqId
+    $req = New-SnmpRequest ([byte]$PduType) $id $Comm $Oids $MaxRep
+    $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($Ip), $Port)
+    for ($try = 0; $try -le $Retries; $try++) {
+        [void]$script:Udp.Send($req, $req.Length, $ep)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+            $left = [int]($TimeoutMs - $sw.ElapsedMilliseconds)
+            if ($left -lt 1) { break }
+            $script:Udp.Client.ReceiveTimeout = $left
+            $buf = $null
+            try {
+                $rep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+                $buf = $script:Udp.Receive([ref]$rep)
+            }
+            catch { continue }
+            $r = $null
+            try { $r = ConvertFrom-SnmpResponse $buf } catch { continue }
+            if ($r.ReqId -eq $id) { return $r }
+        }
+    }
+    return $null
+}
+
+function Get-SnmpWalk([string]$Ip, [string]$Comm, [string]$Base) {
+    $res = New-Object System.Collections.ArrayList
+    $prefix = $Base + '.'
+    $cur = $Base
+    while ($res.Count -lt 50000) {
+        $r = $null
+        if (-not $V1 -and -not $script:NoBulk.ContainsKey($Ip)) {
+            $r = Invoke-Snmp $Ip $Comm 0xA5 @($cur) 20
+            if ($null -eq $r -or $r.Error -ne 0) { $script:NoBulk[$Ip] = $true; $r = $null }
+        }
+        if ($null -eq $r) { $r = Invoke-Snmp $Ip $Comm 0xA1 @($cur) 0 }
+        if ($null -eq $r -or $r.Error -ne 0 -or $r.VarBinds.Count -eq 0) { break }
+        $done = $false
+        foreach ($vb in $r.VarBinds) {
+            if ($vb.Tag -ge 0x80 -and $vb.Tag -le 0x82) { $done = $true; break }
+            if (-not $vb.Oid.StartsWith($prefix)) { $done = $true; break }
+            if ($vb.Oid -eq $cur) { $done = $true; break }
+            [void]$res.Add($vb)
+            $cur = $vb.Oid
+        }
+        if ($done) { break }
+    }
+    return , $res
+}
+
+# Schickt an alle Adressen gleichzeitig eine sysName/sysDescr-Abfrage und sammelt die Antworten
+function Find-SnmpHosts([string[]]$Ips) {
+    $found = @{}
+    $pending = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($i in $Ips) { [void]$pending.Add($i) }
+    foreach ($comm in $Community) {
+        for ($try = 0; $try -le $Retries; $try++) {
+            if ($pending.Count -eq 0) { break }
+            $script:ReqId = ($script:ReqId + 1) % 2000000000
+            $req = New-SnmpRequest ([byte]0xA0) $script:ReqId $comm @('1.3.6.1.2.1.1.5.0', '1.3.6.1.2.1.1.1.0') 0
+            $n = 0
+            foreach ($ip in @($pending)) {
+                $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), $Port)
+                try { [void]$script:Udp.Send($req, $req.Length, $ep) } catch { }
+                $n++
+                if ($n % 64 -eq 0) { Start-Sleep -Milliseconds 15 }
+            }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($sw.ElapsedMilliseconds -lt $TimeoutMs -and $pending.Count -gt 0) {
+                $left = [int]($TimeoutMs - $sw.ElapsedMilliseconds)
+                if ($left -lt 1) { break }
+                $script:Udp.Client.ReceiveTimeout = $left
+                $buf = $null
+                $rep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+                try { $buf = $script:Udp.Receive([ref]$rep) } catch { continue }
+                $r = $null
+                try { $r = ConvertFrom-SnmpResponse $buf } catch { continue }
+                $src = $rep.Address.ToString()
+                if ($r.Error -ne 0 -or -not $pending.Contains($src)) { continue }
+                $sysName = ''; $sysDescr = ''
+                foreach ($vb in $r.VarBinds) {
+                    if ($vb.Tag -ne 0x04) { continue }
+                    if ($vb.Oid -eq '1.3.6.1.2.1.1.5.0') { $sysName = ConvertTo-Text $vb.Bytes }
+                    if ($vb.Oid -eq '1.3.6.1.2.1.1.1.0') { $sysDescr = ConvertTo-Text $vb.Bytes }
+                }
+                $found[$src] = @{ Community = $comm; SysName = $sysName; SysDescr = $sysDescr }
+                [void]$pending.Remove($src)
+            }
+        }
+    }
+    return $found
+}
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
+function ConvertTo-Hex([byte[]]$B) {
+    if ($null -eq $B -or $B.Length -eq 0) { return '' }
+    return (($B | ForEach-Object { $_.ToString('x2') }) -join ':')
+}
+
+function Test-Printable([byte[]]$B) {
+    if ($null -eq $B -or $B.Length -eq 0) { return $false }
+    foreach ($x in $B) { if ($x -lt 0x20 -or $x -gt 0x7E) { return $false } }
+    return $true
+}
+
+function ConvertTo-Text([byte[]]$B) {
+    if ($null -eq $B -or $B.Length -eq 0) { return '' }
+    $n = $B.Length
+    while ($n -gt 0 -and $B[$n - 1] -eq 0) { $n-- }
+    if ($n -eq 0) { return '' }
+    $s = [System.Text.Encoding]::UTF8.GetString($B, 0, $n)
+    if ($s -match '[\x00-\x08\x0B\x0C\x0E-\x1F]') { return (ConvertTo-Hex $B) }
+    return ($s -replace '\s+', ' ').Trim()
+}
+
+# LLDP-ID (Chassis oder Port) je nach Subtype lesbar machen
+function Format-LldpId([int]$Subtype, [byte[]]$B, [bool]$IsChassis) {
+    if ($null -eq $B -or $B.Length -eq 0) { return '' }
+    $macType = 3; $netType = 4
+    if ($IsChassis) { $macType = 4; $netType = 5 }
+    if ($Subtype -eq $macType -and $B.Length -eq 6) { return (ConvertTo-Hex $B) }
+    if ($Subtype -eq $netType -and $B.Length -eq 5 -and $B[0] -eq 1) { return ('{0}.{1}.{2}.{3}' -f $B[1], $B[2], $B[3], $B[4]) }
+    if ($B.Length -eq 6 -and -not (Test-Printable $B)) { return (ConvertTo-Hex $B) }
+    $t = ConvertTo-Text $B
+    $h = ($t -replace '[:\-\. ]', '')
+    if ($Subtype -eq $macType -and $h -match '^[0-9a-fA-F]{12}$') {
+        return ((($h.ToLower() -split '(..)') | Where-Object { $_ }) -join ':')
+    }
+    return $t
+}
+
+function Get-PortLabel([int]$Subtype, [byte[]]$IdBytes, [string]$Desc) {
+    $id = Format-LldpId $Subtype $IdBytes $false
+    $lbl = $id
+    if ($Subtype -eq 3 -or $Subtype -eq 4 -or -not $id) {
+        if ($Desc) { $lbl = $Desc }
+    }
+    elseif ($id -match '^\d+$' -and $Desc -and $Desc -ne $id -and $Desc.Length -le 28) {
+        if ($Desc -match ('(^|\D)' + $id + '$')) { $lbl = $Desc } else { $lbl = "$Desc [$id]" }
+    }
+    $lbl = $lbl -replace '^(Ten-?GigabitEthernet|TenGigE)', 'Te' -replace '^GigabitEthernet', 'Gi' -replace '^FastEthernet', 'Fa'
+    if ($lbl.Length -gt 40) { $lbl = $lbl.Substring(0, 39) + '~' }
+    return $lbl
+}
+
+function Get-NodeType([byte[]]$Caps, [bool]$Scanned) {
+    $c = 0
+    if ($null -ne $Caps -and $Caps.Length -gt 0) { $c = [int]$Caps[0] }
+    if ($c -band 0x04) { return 'phone' }
+    if ($c -band 0x10) { return 'ap' }
+    if ($c -band 0x20) { return 'switch' }
+    if ($c -band 0x08) { return 'router' }
+    if ($Scanned) { return 'switch' }
+    return 'other'
+}
+
+function Get-SortKey([string]$s) {
+    return [regex]::Replace($s, '\d+', { param($m) $m.Value.PadLeft(6, '0') })
+}
+
+function Expand-Target([string[]]$Items) {
+    $out = New-Object System.Collections.ArrayList
+    foreach ($raw in $Items) {
+        foreach ($item in ($raw -split '[,;\s]+' | Where-Object { $_ })) {
+            if ($item -match '^(\d{1,3}(\.\d{1,3}){3})/(\d{1,2})$') {
+                $prefix = [int]$Matches[3]
+                if ($prefix -lt 16 -or $prefix -gt 32) { throw "Netz $item : nur /16 bis /32 erlaubt" }
+                $o = $Matches[1].Split('.') | ForEach-Object { [long]$_ }
+                [long]$ip = ($o[0] -shl 24) + ($o[1] -shl 16) + ($o[2] -shl 8) + $o[3]
+                [long]$size = [long]1 -shl (32 - $prefix)
+                [long]$net = $ip - ($ip % $size)
+                $first = $net; $last = $net + $size - 1
+                if ($prefix -le 30) { $first++; $last-- }
+                for ($a = $first; $a -le $last; $a++) {
+                    [void]$out.Add(('{0}.{1}.{2}.{3}' -f (($a -shr 24) -band 255), (($a -shr 16) -band 255), (($a -shr 8) -band 255), ($a -band 255)))
+                }
+            }
+            elseif ($item -match '^\d{1,3}(\.\d{1,3}){3}$') { [void]$out.Add($item) }
+            else {
+                try {
+                    $addr = [System.Net.Dns]::GetHostAddresses($item) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+                    if ($addr) { [void]$out.Add($addr.ToString()) } else { Write-Warning "$item : keine IPv4-Adresse gefunden" }
+                }
+                catch { Write-Warning "$item : Name nicht aufloesbar" }
+            }
+        }
+    }
+    return , @($out | Select-Object -Unique)
+}
+
+# ---------------------------------------------------------------------------
+# LLDP eines Geraets auslesen
+# ---------------------------------------------------------------------------
+function Get-DeviceLldp([string]$Ip, $Sys) {
+    $comm = $Sys.Community
+
+    # lldpLocalSystemData
+    $locBase = '1.0.8802.1.1.2.1.3.'
+    $chSub = 0; $chId = $null; $caps = $null; $lName = ''; $lDesc = ''
+    $ports = @{}
+    foreach ($vb in (Get-SnmpWalk $Ip $comm '1.0.8802.1.1.2.1.3')) {
+        $s = $vb.Oid.Substring($locBase.Length)
+        if ($s -eq '1.0') { $chSub = [int](ConvertTo-Int $vb.Bytes) }
+        elseif ($s -eq '2.0') { $chId = $vb.Bytes }
+        elseif ($s -eq '3.0') { $lName = ConvertTo-Text $vb.Bytes }
+        elseif ($s -eq '4.0') { $lDesc = ConvertTo-Text $vb.Bytes }
+        elseif ($s -eq '6.0') { $caps = $vb.Bytes }
+        elseif ($s.StartsWith('7.1.')) {
+            $p = $s.Split('.')
+            if ($p.Count -lt 4) { continue }
+            $num = $p[3]
+            if (-not $ports.ContainsKey($num)) { $ports[$num] = @{ Sub = 0; Id = $null; Desc = '' } }
+            if ($p[2] -eq '2') { $ports[$num].Sub = [int](ConvertTo-Int $vb.Bytes) }
+            elseif ($p[2] -eq '3') { $ports[$num].Id = $vb.Bytes }
+            elseif ($p[2] -eq '4') { $ports[$num].Desc = ConvertTo-Text $vb.Bytes }
+        }
+    }
+
+    # lldpRemTable
+    $remBase = '1.0.8802.1.1.2.1.4.1.1.'
+    $nb = @{}
+    $order = New-Object System.Collections.ArrayList
+    foreach ($vb in (Get-SnmpWalk $Ip $comm '1.0.8802.1.1.2.1.4.1.1')) {
+        $p = $vb.Oid.Substring($remBase.Length).Split('.')
+        if ($p.Count -lt 4) { continue }
+        $k = $p[1] + '.' + $p[2] + '.' + $p[3]
+        if (-not $nb.ContainsKey($k)) {
+            $nb[$k] = @{ PortNum = $p[2]; ChSub = 0; ChId = $null; PSub = 0; PId = $null; PDesc = ''; Name = ''; Desc = ''; CapS = $null; CapE = $null; Mgmt = '' }
+            [void]$order.Add($k)
+        }
+        $e = $nb[$k]
+        $col = $p[0]
+        if ($col -eq '4') { $e.ChSub = [int](ConvertTo-Int $vb.Bytes) }
+        elseif ($col -eq '5') { $e.ChId = $vb.Bytes }
+        elseif ($col -eq '6') { $e.PSub = [int](ConvertTo-Int $vb.Bytes) }
+        elseif ($col -eq '7') { $e.PId = $vb.Bytes }
+        elseif ($col -eq '8') { $e.PDesc = ConvertTo-Text $vb.Bytes }
+        elseif ($col -eq '9') { $e.Name = ConvertTo-Text $vb.Bytes }
+        elseif ($col -eq '10') { $e.Desc = ConvertTo-Text $vb.Bytes }
+        elseif ($col -eq '11') { $e.CapS = $vb.Bytes }
+        elseif ($col -eq '12') { $e.CapE = $vb.Bytes }
+    }
+
+    # lldpRemManAddrTable - die Adresse steckt im Index
+    $manBase = '1.0.8802.1.1.2.1.4.2.1.'
+    if ($order.Count -gt 0) {
+        foreach ($vb in (Get-SnmpWalk $Ip $comm '1.0.8802.1.1.2.1.4.2.1')) {
+            $p = $vb.Oid.Substring($manBase.Length).Split('.')
+            if ($p.Count -lt 9) { continue }
+            $k = $p[1] + '.' + $p[2] + '.' + $p[3]
+            if (-not $nb.ContainsKey($k) -or $nb[$k].Mgmt -or $p[4] -ne '1') { continue }
+            $a = @($p[5..($p.Count - 1)])
+            $m = ''
+            if ($a.Count -eq 5 -and $a[0] -eq '4') { $m = ($a[1..4] -join '.') }
+            elseif ($a.Count -eq 4) { $m = ($a -join '.') }
+            if ($m -and $m -ne '0.0.0.0') { $nb[$k].Mgmt = $m }
+        }
+    }
+
+    $key = Format-LldpId $chSub $chId $true
+    if (-not $key) { $key = 'ip:' + $Ip }
+    $devName = $Sys.SysName
+    if (-not $devName) { $devName = $lName }
+    if (-not $devName) { $devName = $Ip }
+    $devDesc = $Sys.SysDescr
+    if (-not $devDesc) { $devDesc = $lDesc }
+
+    $neighbors = New-Object System.Collections.ArrayList
+    foreach ($k in $order) {
+        $e = $nb[$k]
+        $lp = $ports[$e.PortNum]
+        if ($lp) {
+            $localLabel = Get-PortLabel $lp.Sub $lp.Id $lp.Desc
+            $localKey = Format-LldpId $lp.Sub $lp.Id $false
+        }
+        else { $localLabel = ''; $localKey = '' }
+        if (-not $localLabel) { $localLabel = 'Port ' + $e.PortNum }
+        if (-not $localKey) { $localKey = 'num' + $e.PortNum }
+
+        $rKey = Format-LldpId $e.ChSub $e.ChId $true
+        if (-not $rKey -and $e.Name) { $rKey = 'name:' + $e.Name }
+        if (-not $rKey) { continue }
+        $rPortKey = Format-LldpId $e.PSub $e.PId $false
+        if (-not $rPortKey) { $rPortKey = 'idx' + $k }
+        $rCaps = $e.CapE
+        if ($null -eq $rCaps -or $rCaps.Length -eq 0 -or $rCaps[0] -eq 0) { $rCaps = $e.CapS }
+        $rName = $e.Name
+        if (-not $rName) { $rName = $rKey }
+
+        [void]$neighbors.Add([pscustomobject]@{
+                LocalPort    = $localLabel
+                LocalPortKey = $localKey
+                Key          = $rKey
+                Name         = $rName
+                Port         = (Get-PortLabel $e.PSub $e.PId $e.PDesc)
+                PortKey      = $rPortKey
+                Descr        = $e.Desc
+                Type         = (Get-NodeType $rCaps $false)
+                Mgmt         = $e.Mgmt
+            })
+    }
+
+    return [pscustomobject]@{
+        Ip        = $Ip
+        Key       = $key
+        Name      = $devName
+        Descr     = $devDesc
+        Type      = (Get-NodeType $caps $true)
+        Neighbors = $neighbors
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Scan
+# ---------------------------------------------------------------------------
+$ips = Expand-Target $Target
+if ($ips.Count -eq 0) { throw 'Keine gueltigen Ziele angegeben.' }
+Write-Host ("Suche SNMP-Geraete unter {0} Adresse(n), Community: {1} ..." -f $ips.Count, ($Community -join ', '))
+
+$known = Find-SnmpHosts $ips
+$tried = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($i in $ips) { [void]$tried.Add($i) }
+$queue = New-Object System.Collections.Queue
+foreach ($i in ($known.Keys | Sort-Object { Get-SortKey $_ })) { $queue.Enqueue($i) }
+Write-Host ("{0} Geraet(e) antworten per SNMP." -f $known.Count)
+
+$devices = New-Object System.Collections.ArrayList
+$seenKeys = @{}
+while ($queue.Count -gt 0) {
+    $ip = $queue.Dequeue()
+    $dev = Get-DeviceLldp $ip $known[$ip]
+    if ($seenKeys.ContainsKey($dev.Key)) {
+        Write-Host ("  {0,-15} {1} - gleiches Geraet wie {2}, uebersprungen" -f $ip, $dev.Name, $seenKeys[$dev.Key])
+        continue
+    }
+    $seenKeys[$dev.Key] = $ip
+    [void]$devices.Add($dev)
+    $hint = ''
+    if ($dev.Neighbors.Count -eq 0) { $hint = '  (LLDP aus oder keine LLDP-MIB?)' }
+    Write-Host ("  {0,-15} {1,-28} {2,3} LLDP-Nachbarn{3}" -f $ip, $dev.Name, $dev.Neighbors.Count, $hint)
+
+    if (-not $NoCrawl) {
+        foreach ($n in $dev.Neighbors) {
+            if (-not $n.Mgmt -or $tried.Contains($n.Mgmt)) { continue }
+            if ($n.Type -ne 'switch' -and $n.Type -ne 'router') { continue }
+            [void]$tried.Add($n.Mgmt)
+            $hit = Find-SnmpHosts @($n.Mgmt)
+            if ($hit.ContainsKey($n.Mgmt)) {
+                $known[$n.Mgmt] = $hit[$n.Mgmt]
+                $queue.Enqueue($n.Mgmt)
+            }
+            else {
+                Write-Host ("  {0,-15} {1,-28} per LLDP gesehen, antwortet nicht auf SNMP" -f $n.Mgmt, $n.Name)
+            }
+        }
+    }
+}
+$script:Udp.Close()
+
+if ($devices.Count -eq 0) {
+    Write-Warning 'Kein Geraet hat geantwortet. Community, SNMP-Freigabe (ACL/Management-VLAN) und Firewall pruefen, ggf. -V1 testen.'
+    return
+}
+
+# ---------------------------------------------------------------------------
+# Knoten und Links zusammenfuehren
+# ---------------------------------------------------------------------------
+# Meldet ein Nachbar eine andere Chassis-ID als das Geraet selbst, ueber die Management-IP zuordnen
+$alias = @{}
+$ipToKey = @{}
+foreach ($d in $devices) { $ipToKey[$d.Ip] = $d.Key }
+foreach ($d in $devices) {
+    foreach ($n in $d.Neighbors) {
+        if ($n.Mgmt -and $ipToKey.ContainsKey($n.Mgmt) -and $ipToKey[$n.Mgmt] -ne $n.Key -and -not $seenKeys.ContainsKey($n.Key)) {
+            $alias[$n.Key] = $ipToKey[$n.Mgmt]
+        }
+    }
+}
+
+$nodes = [ordered]@{}
+foreach ($d in $devices) {
+    $nodes[$d.Key] = [pscustomobject]@{ Id = ''; Key = $d.Key; Name = $d.Name; Ip = $d.Ip; Descr = $d.Descr; Type = $d.Type; Scanned = $true }
+}
+$links = [ordered]@{}
+foreach ($d in $devices) {
+    foreach ($n in $d.Neighbors) {
+        $rk = $n.Key
+        if ($alias.ContainsKey($rk)) { $rk = $alias[$rk] }
+        if ($rk -eq $d.Key) { continue }
+        if (-not $nodes.Contains($rk)) {
+            $nodes[$rk] = [pscustomobject]@{ Id = ''; Key = $rk; Name = $n.Name; Ip = $n.Mgmt; Descr = $n.Descr; Type = $n.Type; Scanned = $false }
+        }
+        else {
+            $x = $nodes[$rk]
+            if (-not $x.Scanned) {
+                if (-not $x.Ip -and $n.Mgmt) { $x.Ip = $n.Mgmt }
+                if (-not $x.Descr -and $n.Descr) { $x.Descr = $n.Descr }
+                if ($x.Type -eq 'other' -and $n.Type -ne 'other') { $x.Type = $n.Type }
+            }
+        }
+        $ea = $d.Key + '|' + $n.LocalPortKey
+        $eb = $rk + '|' + $n.PortKey
+        if ([string]::CompareOrdinal($ea, $eb) -le 0) { $lk = $ea + '||' + $eb } else { $lk = $eb + '||' + $ea }
+        if ($links.Contains($lk)) {
+            # Link wurde schon von der Gegenseite gemeldet: eigene Portbezeichnung hat Vorrang
+            $l = $links[$lk]
+            if ($l.AEnd -eq $ea) { $l.APort = $n.LocalPort } else { $l.BPort = $n.LocalPort }
+            $l.Both = $true
+        }
+        else {
+            $links[$lk] = [pscustomobject]@{ AKey = $d.Key; AEnd = $ea; APort = $n.LocalPort; BKey = $rk; BEnd = $eb; BPort = $n.Port; Both = $false }
+        }
+    }
+}
+
+$i = 0
+foreach ($n in $nodes.Values) { $i++; $n.Id = 'n' + $i }
+$nodeList = @($nodes.Values)
+$linkList = @($links.Values | Sort-Object { Get-SortKey $nodes[$_.AKey].Name }, { Get-SortKey $_.APort })
+
+# ---------------------------------------------------------------------------
+# Ausgabe: CSV
+# ---------------------------------------------------------------------------
+if (-not (Test-Path -LiteralPath $OutDir)) { [void](New-Item -ItemType Directory -Path $OutDir) }
+$OutDir = (Resolve-Path -LiteralPath $OutDir).Path
+$typeText = @{ switch = 'Switch'; router = 'Router/Firewall'; ap = 'Access Point'; phone = 'Telefon'; other = 'Sonstiges' }
+
+$linkRows = foreach ($l in $linkList) {
+    $a = $nodes[$l.AKey]; $b = $nodes[$l.BKey]
+    $src = 'eine Seite'
+    if ($l.Both) { $src = 'beide Seiten' }
+    [pscustomobject]@{
+        GeraetA   = $a.Name; IpA = $a.Ip; PortA = $l.APort
+        PortB     = $l.BPort; GeraetB = $b.Name; IpB = $b.Ip
+        TypB      = $typeText[$b.Type]; GemeldetVon = $src
+    }
+}
+$devRows = foreach ($n in ($nodeList | Sort-Object { Get-SortKey $_.Name })) {
+    $q = 'nein (nur per LLDP gesehen)'
+    if ($n.Scanned) { $q = 'ja' }
+    [pscustomobject]@{ Name = $n.Name; Ip = $n.Ip; Typ = $typeText[$n.Type]; Abgefragt = $q; ChassisId = $n.Key; Beschreibung = $n.Descr }
+}
+$csvLinks = Join-Path $OutDir ($Name + '_links.csv')
+$csvDevs = Join-Path $OutDir ($Name + '_devices.csv')
+$csvEnc = 'UTF8'
+if ($PSVersionTable.PSVersion.Major -ge 6) { $csvEnc = 'utf8BOM' }
+@($linkRows) | Export-Csv -LiteralPath $csvLinks -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
+@($devRows) | Export-Csv -LiteralPath $csvDevs -Delimiter ';' -NoTypeInformation -Encoding $csvEnc
+
+# ---------------------------------------------------------------------------
+# Ausgabe: draw.io
+# ---------------------------------------------------------------------------
+function Test-Big($n) { return ($n.Type -eq 'switch' -or $n.Type -eq 'router') }
+function Get-NodeSize($n) { if (Test-Big $n) { return @(200, 64) } else { return @(150, 40) } }
+
+function Get-TreeWidth([string]$Id, $Kids, $ById, $Width) {
+    $own = (Get-NodeSize $ById[$Id])[0] + 40
+    $sum = 0
+    foreach ($k in $Kids[$Id]) { $sum += (Get-TreeWidth $k $Kids $ById $Width) }
+    if ($sum -gt $own) { $Width[$Id] = $sum } else { $Width[$Id] = $own }
+    return $Width[$Id]
+}
+function Set-TreePos([string]$Id, [double]$X0, $Kids, $Depth, $Width, $Pos) {
+    $Pos[$Id] = @(($X0 + $Width[$Id] / 2), ($Depth[$Id] * 170))
+    $sum = 0
+    foreach ($k in $Kids[$Id]) { $sum += $Width[$k] }
+    $cx = $X0 + ($Width[$Id] - $sum) / 2
+    foreach ($k in $Kids[$Id]) { Set-TreePos $k $cx $Kids $Depth $Width $Pos; $cx += $Width[$k] }
+}
+function Get-Layout($NodeSet, $LinkSet) {
+    $byId = @{}; $adj = @{}
+    foreach ($n in $NodeSet) { $byId[$n.Id] = $n; $adj[$n.Id] = New-Object System.Collections.ArrayList }
+    foreach ($l in $LinkSet) {
+        if (-not $adj[$l.A].Contains($l.B)) { [void]$adj[$l.A].Add($l.B) }
+        if (-not $adj[$l.B].Contains($l.A)) { [void]$adj[$l.B].Add($l.A) }
+    }
+    $rank = { param($id) $n = $byId[$id]; $g = 1; if (Test-Big $n) { $g = 0 }; '{0}{1:d5}{2}' -f $g, (99999 - $adj[$id].Count), (Get-SortKey $n.Name) }
+    $pos = @{}; $seen = @{}; $offX = 0.0
+    foreach ($rootId in @($NodeSet | ForEach-Object { $_.Id } | Sort-Object { & $rank $_ })) {
+        if ($seen.ContainsKey($rootId)) { continue }
+        $kids = @{}; $depth = @{}; $width = @{}
+        $q = New-Object System.Collections.Queue
+        $q.Enqueue($rootId); $seen[$rootId] = $true; $depth[$rootId] = 0
+        while ($q.Count -gt 0) {
+            $u = $q.Dequeue()
+            $kids[$u] = New-Object System.Collections.ArrayList
+            foreach ($v in @($adj[$u] | Sort-Object { & $rank $_ })) {
+                if ($seen.ContainsKey($v)) { continue }
+                $seen[$v] = $true; $depth[$v] = $depth[$u] + 1
+                [void]$kids[$u].Add($v); $q.Enqueue($v)
+            }
+        }
+        [void](Get-TreeWidth $rootId $kids $byId $width)
+        Set-TreePos $rootId $offX $kids $depth $width $pos
+        $offX += $width[$rootId] + 80
+    }
+    return $pos
+}
+
+function ConvertTo-XmlText([string]$s) { return [System.Security.SecurityElement]::Escape($s) }
+
+$dNodes = @($nodeList | Where-Object { $IncludeEndpoints -or (Test-Big $_) })
+$dIds = @{}
+foreach ($n in $dNodes) { $dIds[$n.Id] = $true }
+$dLinks = @(foreach ($l in $linkList) {
+        $a = $nodes[$l.AKey].Id; $b = $nodes[$l.BKey].Id
+        if ($dIds.ContainsKey($a) -and $dIds.ContainsKey($b)) { [pscustomobject]@{ A = $a; B = $b; APort = $l.APort; BPort = $l.BPort } }
+    })
+$pos = Get-Layout $dNodes $dLinks
+$styleByType = @{
+    switch = 'fillColor=#dae8fc;strokeColor=#6c8ebf;'
+    router = 'fillColor=#e1d5e7;strokeColor=#9673a6;'
+    ap     = 'fillColor=#d5e8d4;strokeColor=#82b366;'
+    phone  = 'fillColor=#ffe6cc;strokeColor=#d79b00;'
+    other  = 'fillColor=#f5f5f5;strokeColor=#666666;'
+}
+$x = New-Object System.Text.StringBuilder
+[void]$x.Append('<mxfile host="app.diagrams.net"><diagram name="' + (ConvertTo-XmlText $Name) + '" id="netzplan">')
+[void]$x.Append('<mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>')
+foreach ($n in $dNodes) {
+    $sz = Get-NodeSize $n
+    $label = '<b>' + (ConvertTo-XmlText $n.Name) + '</b>'
+    if ($n.Ip) { $label += '<br>' + (ConvertTo-XmlText $n.Ip) }
+    $style = 'rounded=1;whiteSpace=wrap;html=1;fontSize=11;' + $styleByType[$n.Type]
+    if (-not $n.Scanned) { $style += 'dashed=1;' }
+    $px = [math]::Round($pos[$n.Id][0] - $sz[0] / 2); $py = [math]::Round($pos[$n.Id][1] - $sz[1] / 2)
+    [void]$x.Append(('<mxCell id="{0}" value="{1}" style="{2}" vertex="1" parent="1"><mxGeometry x="{3}" y="{4}" width="{5}" height="{6}" as="geometry"/></mxCell>' -f $n.Id, (ConvertTo-XmlText $label), $style, $px, $py, $sz[0], $sz[1]))
+}
+$pairCount = @{}; $pairIdx = @{}
+foreach ($l in $dLinks) {
+    if ([string]::CompareOrdinal($l.A, $l.B) -le 0) { $pk = $l.A + '|' + $l.B } else { $pk = $l.B + '|' + $l.A }
+    if ($pairCount.ContainsKey($pk)) { $pairCount[$pk]++ } else { $pairCount[$pk] = 1 }
+}
+$e = 0
+foreach ($l in $dLinks) {
+    $e++
+    if ([string]::CompareOrdinal($l.A, $l.B) -le 0) { $pk = $l.A + '|' + $l.B; $p1 = $pos[$l.A]; $p2 = $pos[$l.B] } else { $pk = $l.B + '|' + $l.A; $p1 = $pos[$l.B]; $p2 = $pos[$l.A] }
+    if ($pairIdx.ContainsKey($pk)) { $pairIdx[$pk]++ } else { $pairIdx[$pk] = 0 }
+    $geo = '<mxGeometry relative="1" as="geometry"/>'
+    $style = 'endArrow=none;html=1;rounded=0;strokeWidth=2;strokeColor=#5b6b7c;'
+    if ($pairCount[$pk] -gt 1) {
+        # parallele Links (LAG) leicht auseinanderziehen
+        $off = ($pairIdx[$pk] - ($pairCount[$pk] - 1) / 2) * 40
+        $dx = $p2[0] - $p1[0]; $dy = $p2[1] - $p1[1]
+        $len = [math]::Sqrt($dx * $dx + $dy * $dy); if ($len -lt 1) { $len = 1 }
+        $mx = [math]::Round(($p1[0] + $p2[0]) / 2 - $dy / $len * $off); $my = [math]::Round(($p1[1] + $p2[1]) / 2 + $dx / $len * $off)
+        $geo = '<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="' + $mx + '" y="' + $my + '"/></Array></mxGeometry>'
+        $style += 'curved=1;'
+    }
+    [void]$x.Append(('<mxCell id="e{0}" style="{1}" edge="1" parent="1" source="{2}" target="{3}">{4}</mxCell>' -f $e, $style, $l.A, $l.B, $geo))
+    $ls = 'edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontFamily=Courier New;'
+    [void]$x.Append(('<mxCell id="e{0}a" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="-0.6" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.APort)), $ls))
+    [void]$x.Append(('<mxCell id="e{0}b" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="0.6" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.BPort)), $ls))
+}
+[void]$x.Append('</root></mxGraphModel></diagram></mxfile>')
+$drawio = Join-Path $OutDir ($Name + '.drawio')
+[System.IO.File]::WriteAllText($drawio, $x.ToString(), (New-Object System.Text.UTF8Encoding $false))
+
+# ---------------------------------------------------------------------------
+# Ausgabe: HTML
+# ---------------------------------------------------------------------------
+function ConvertTo-JsString([string]$s) {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $s.ToCharArray()) {
+        $c = [int]$ch
+        if ($c -eq 34 -or $c -eq 92) { [void]$sb.Append('\').Append($ch) }
+        elseif ($c -lt 0x20 -or $c -gt 0x7E -or $c -eq 60 -or $c -eq 62 -or $c -eq 38) { [void]$sb.Append('\u').Append($c.ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+$jNodes = foreach ($n in $nodeList) {
+    $sc = 'false'; if ($n.Scanned) { $sc = 'true' }
+    '{"id":' + (ConvertTo-JsString $n.Id) + ',"name":' + (ConvertTo-JsString $n.Name) + ',"ip":' + (ConvertTo-JsString $n.Ip) + ',"descr":' + (ConvertTo-JsString $n.Descr) + ',"type":' + (ConvertTo-JsString $n.Type) + ',"scanned":' + $sc + '}'
+}
+$jLinks = foreach ($l in $linkList) {
+    '{"a":' + (ConvertTo-JsString $nodes[$l.AKey].Id) + ',"aPort":' + (ConvertTo-JsString $l.APort) + ',"b":' + (ConvertTo-JsString $nodes[$l.BKey].Id) + ',"bPort":' + (ConvertTo-JsString $l.BPort) + '}'
+}
+$json = '{"name":' + (ConvertTo-JsString $Name) + ',"generated":' + (ConvertTo-JsString (Get-Date -Format 'dd.MM.yyyy HH:mm')) + ',"nodes":[' + (@($jNodes) -join ',') + '],"links":[' + (@($jLinks) -join ',') + ']}'
+
+$template = @'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Netzplan</title>
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:14px/1.4 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;color:#17212b;background:#eef1f5;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:10px 18px;background:#101b2b;color:#fff}
+header h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+header .sub{font-size:12px;color:#9fb0c5;margin-top:1px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid #33455c;background:transparent;color:#9fb0c5;font:inherit;font-size:12px;cursor:pointer;user-select:none}
+.chip i{width:9px;height:9px;border-radius:50%;display:inline-block;opacity:.35}
+.chip.on{background:#1d2c42;color:#fff;border-color:#4a6283}
+.chip.on i{opacity:1}
+.chip b{font-weight:600;color:inherit;opacity:.7}
+.btns{display:flex;gap:6px}
+.btn{padding:5px 11px;border-radius:6px;border:1px solid #33455c;background:#1d2c42;color:#fff;font:inherit;font-size:12px;cursor:pointer}
+.btn:hover,.chip:hover{border-color:#7f9cc4}
+main{flex:1;display:flex;min-height:0}
+#cv{flex:1;min-width:0;height:100%;display:block;cursor:grab;touch-action:none;background:#eef1f5}
+#cv.grabbing{cursor:grabbing}
+aside{width:430px;max-width:45vw;background:#fff;border-left:1px solid #d5dbe3;display:flex;flex-direction:column;min-height:0}
+#side{overflow:auto;padding:16px 16px 24px}
+#side h2{font-size:15px;margin:0 0 2px}
+#side .hint{color:#687888;font-size:12px;margin:0 0 12px}
+#side .hd{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+#side .hd h2{margin:0}
+#side .dot{width:11px;height:11px;border-radius:50%;flex:none}
+#side dl{display:grid;grid-template-columns:82px 1fr;gap:3px 10px;margin:0 0 14px;font-size:12.5px}
+#side dt{color:#687888}
+#side dd{margin:0;word-break:break-word}
+#side input{width:100%;padding:7px 10px;border:1px solid #c9d1db;border-radius:6px;font:inherit;margin-bottom:10px}
+#side input:focus{outline:2px solid #1668c7;outline-offset:-1px}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th{text-align:left;color:#687888;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px;padding:4px 6px;border-bottom:1px solid #d5dbe3;position:sticky;top:-16px;background:#fff}
+td{padding:5px 6px;border-bottom:1px solid #edf0f4;vertical-align:top}
+td.p{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px;white-space:nowrap}
+td.n{white-space:nowrap}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:#f2f6fb}
+td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.back{background:none;border:0;color:#1668c7;font:inherit;font-size:12.5px;padding:0;margin-bottom:10px;cursor:pointer}
+@media print{header .chips,header .btns,aside{display:none}header{background:#fff;color:#000}header .sub{color:#444}}
+</style>
+</head>
+<body>
+<header>
+  <div><h1 id="ttl"></h1><div class="sub" id="sub"></div></div>
+  <div class="chips" id="chips"></div>
+  <div class="btns">
+    <button class="btn" id="bFit">Einpassen</button>
+    <button class="btn" id="bReset">Layout zur&uuml;cksetzen</button>
+    <button class="btn" id="bSvg">Als SVG speichern</button>
+  </div>
+</header>
+<main>
+<svg id="cv" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .lk{stroke:#7d8b9a;stroke-width:2;fill:none}
+      .lk.hot{stroke:#1668c7;stroke-width:3}
+      .lk.dim{opacity:.18}
+      .pl rect{fill:#fff;stroke:#b9c3cf;stroke-width:1}
+      .pl text{font:11px ui-monospace,Consolas,Menlo,monospace;fill:#27323e}
+      .pl.hot rect{stroke:#1668c7;fill:#eaf2fc}
+      .pl.dim{opacity:.15}
+      .nd{cursor:pointer}
+      .nd .card{fill:#fff;stroke:#c3ccd7;stroke-width:1.2}
+      .nd.ghost .card{stroke-dasharray:5 4;fill:#f8f9fb}
+      .nd.sel .card{stroke:#1668c7;stroke-width:2.5}
+      .nd.dim{opacity:.3}
+      .nd .nm{font:600 13px "Segoe UI",system-ui,sans-serif;fill:#17212b}
+      .nd .nm.sm{font-size:12px}
+      .nd .ip{font:11px ui-monospace,Consolas,Menlo,monospace;fill:#4d5c6b}
+      .nd .ds{font:10px "Segoe UI",system-ui,sans-serif;fill:#8491a0}
+    </style>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1.2" cy="1.2" r="1.2" fill="#d3dae3"/></pattern>
+    <filter id="sh" x="-10%" y="-20%" width="120%" height="150%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1b2a3d" flood-opacity=".13"/></filter>
+  </defs>
+  <rect id="bg" x="0" y="0" width="100%" height="100%" fill="url(#dots)"/>
+  <g id="root"><g id="gL"></g><g id="gP"></g><g id="gN"></g></g>
+</svg>
+<aside><div id="side"></div></aside>
+</main>
+<script>const DATA = __DATA__;</script>
+<script>
+(function(){
+'use strict';
+const NS='http://www.w3.org/2000/svg';
+const TYPES={switch:['Switches','Switch','#1668c7'],router:['Router/Firewalls','Router/Firewall','#7b46d6'],ap:['Access Points','Access Point','#0c8a5f'],phone:['Telefone','Telefon','#c56a00'],other:['Sonstige','Sonstiges','#66727f']};
+const show={switch:true,router:true,ap:false,phone:false,other:false};
+const nodes=DATA.nodes,links=DATA.links,byId={};
+nodes.forEach(function(n){byId[n.id]=n;n.x=0;n.y=0;});
+const GAPX=44,GAPY=170,LSKEY='netzplan:'+DATA.name+':'+nodes.length+':'+links.length;
+const svg=document.getElementById('cv'),root=document.getElementById('root'),gL=document.getElementById('gL'),gP=document.getElementById('gP'),gN=document.getElementById('gN');
+let view={x:0,y:0,k:1},selected=null,filter='',raf=0;
+
+const isBig=function(n){return n.type==='switch'||n.type==='router';};
+const sz=function(n){return {w:n.w||204,h:n.h||66};};
+function measure(){
+  const deg={};visLinks().forEach(function(l){deg[l.a]=(deg[l.a]||0)+1;deg[l.b]=(deg[l.b]||0)+1;});
+  nodes.forEach(function(n){if(isBig(n)){n.w=Math.max(204,Math.min(460,24+44*(deg[n.id]||0)));n.h=66;}else{n.w=158;n.h=42;}});
+}
+const cut=function(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'\u2026':s;};
+const nat=function(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'});};
+function S(tag,attrs,parent,text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!=null)e.textContent=text;if(parent)parent.appendChild(e);return e;}
+function H(tag,attrs,parent,text){const e=document.createElement(tag);for(const k in (attrs||{}))e.setAttribute(k,attrs[k]);if(text!=null)e.textContent=text;if(parent)parent.appendChild(e);return e;}
+const vis=function(n){return show[n.type];};
+const visLinks=function(){return links.filter(function(l){return vis(byId[l.a])&&vis(byId[l.b]);});};
+function neighbors(id){const s=new Set();links.forEach(function(l){if(l.a===id)s.add(l.b);if(l.b===id)s.add(l.a);});return s;}
+
+function layout(){
+  measure();
+  const v=nodes.filter(vis),adj={};
+  v.forEach(function(n){adj[n.id]=new Set();});
+  visLinks().forEach(function(l){if(l.a!==l.b){adj[l.a].add(l.b);adj[l.b].add(l.a);}});
+  const rank=function(a,b){const A=byId[a],B=byId[b];return (isBig(B)-isBig(A))||(adj[b].size-adj[a].size)||nat(A.name,B.name);};
+  const seen=new Set();let offX=0;
+  v.map(function(n){return n.id;}).sort(rank).forEach(function(r){
+    if(seen.has(r))return;
+    const kids={},depth={},width={},q=[r];seen.add(r);depth[r]=0;
+    while(q.length){const u=q.shift();kids[u]=[];Array.from(adj[u]).sort(rank).forEach(function(w){if(!seen.has(w)){seen.add(w);depth[w]=depth[u]+1;kids[u].push(w);q.push(w);}});}
+    const calc=function(u){let s=0;kids[u].forEach(function(k){s+=calc(k);});return width[u]=Math.max(sz(byId[u]).w+GAPX,s);};
+    const place=function(u,x0){let s=0;kids[u].forEach(function(k){s+=width[k];});byId[u].x=x0+width[u]/2;byId[u].y=depth[u]*GAPY;let cx=x0+(width[u]-s)/2;kids[u].forEach(function(k){place(k,cx);cx+=width[k];});};
+    calc(r);place(r,offX);offX+=width[r]+90;
+  });
+}
+function loadPos(){try{const p=JSON.parse(localStorage.getItem(LSKEY)||'{}');nodes.forEach(function(n){if(p[n.id]){n.x=p[n.id][0];n.y=p[n.id][1];}});}catch(e){}}
+function savePos(){try{const p=JSON.parse(localStorage.getItem(LSKEY)||'{}');nodes.filter(vis).forEach(function(n){p[n.id]=[Math.round(n.x),Math.round(n.y)];});localStorage.setItem(LSKEY,JSON.stringify(p));}catch(e){}}
+function clearPos(){try{localStorage.removeItem(LSKEY);}catch(e){}}
+
+const lblW=function(t){return cut(t,24).length*6.7+14;};
+function anchors(vl){
+  const ends={},out=[];
+  const push=function(id,side,e){const n=ends[id]=ends[id]||{};(n[side]=n[side]||[]).push(e);};
+  vl.forEach(function(l,i){
+    const A=byId[l.a],B=byId[l.b],dx=B.x-A.x,dy=B.y-A.y;out.push({});
+    let sa,sb;
+    if(Math.abs(dy)>Math.abs(dx)*0.3){sa=dy>0?'bottom':'top';sb=dy>0?'top':'bottom';}
+    else{sa=dx>0?'right':'left';sb=dx>0?'left':'right';}
+    push(l.a,sa,{i:i,o:B,end:'a',text:l.aPort});push(l.b,sb,{i:i,o:A,end:'b',text:l.bPort});
+  });
+  Object.keys(ends).forEach(function(id){
+    const N=byId[id],s=sz(N);
+    Object.keys(ends[id]).forEach(function(side){
+      const vert=side==='top'||side==='bottom',list=ends[id][side];
+      list.sort(function(p,q){return vert?(p.o.x-q.o.x)||(p.i-q.i):(p.o.y-q.o.y)||(p.i-q.i);});
+      const n=list.length,step=(vert?s.w:s.h)/(n+1);
+      let maxW=0;list.forEach(function(e){maxW=Math.max(maxW,lblW(e.text));});
+      const rows=Math.max(1,Math.min(3,Math.ceil((vert?maxW+6:21)/step)));
+      list.forEach(function(e,k){
+        const pt=vert?{x:N.x-s.w/2+step*(k+1),y:N.y+(side==='bottom'?s.h/2:-s.h/2)}:{x:N.x+(side==='right'?s.w/2:-s.w/2),y:N.y-s.h/2+step*(k+1)};
+        pt.vert=vert;pt.row=k%rows;pt.maxW=maxW;out[e.i][e.end]=pt;
+      });
+    });
+  });
+  return out;
+}
+function portLabel(p,q,text,cls){
+  if(!text)return;
+  const dx=q.x-p.x,dy=q.y-p.y,len=Math.hypot(dx,dy)||1,ux=dx/len,uy=dy/len,txt=cut(text,24),w=lblW(text);
+  let t=p.vert?(14+p.row*22)/Math.max(Math.abs(uy),0.2):(w/2+8+p.row*(p.maxW+6))/Math.max(Math.abs(ux),0.2);
+  t=Math.min(t,len*0.45);
+  const cx=p.x+ux*t,cy=p.y+uy*t,g=S('g',{'class':'pl'+cls},gP);
+  S('title',{},g,text);
+  S('rect',{x:cx-w/2,y:cy-9.5,width:w,height:19,rx:9.5},g);
+  S('text',{x:cx,y:cy+4,'text-anchor':'middle'},g,txt);
+}
+function drawLink(l,an){
+  const hot=selected&&(l.a===selected||l.b===selected),cls=hot?' hot':(selected?' dim':'');
+  S('line',{x1:an.a.x,y1:an.a.y,x2:an.b.x,y2:an.b.y,'class':'lk'+cls},gL);
+  portLabel(an.a,an.b,l.aPort,cls);
+  portLabel(an.b,an.a,l.bPort,cls);
+}
+function drawNode(n,nb){
+  const s=sz(n),c=TYPES[n.type][2];
+  let cls='nd'+(n.scanned?'':' ghost');
+  if(selected===n.id)cls+=' sel';else if(selected&&!nb.has(n.id))cls+=' dim';
+  const g=S('g',{'class':cls,'data-id':n.id,transform:'translate('+(n.x-s.w/2)+','+(n.y-s.h/2)+')'},gN);
+  S('title',{},g,[n.name,n.ip,n.descr,n.scanned?'':'nicht per SNMP abgefragt'].filter(Boolean).join('\n'));
+  S('rect',{'class':'card',width:s.w,height:s.h,rx:10,filter:'url(#sh)'},g);
+  S('rect',{x:8,y:9,width:5,height:s.h-18,rx:2.5,fill:c},g);
+  if(isBig(n)){
+    S('text',{'class':'nm',x:24,y:25},g,cut(n.name,Math.floor((s.w-36)/7.4)));
+    S('text',{'class':'ip',x:24,y:41},g,n.ip||'keine IP gemeldet');
+    S('text',{'class':'ds',x:24,y:55},g,cut(n.descr,Math.floor((s.w-36)/5.3)));
+  }else{
+    S('text',{'class':'nm sm',x:22,y:18},g,cut(n.name,19));
+    S('text',{'class':'ip',x:22,y:32},g,n.ip||cut(n.descr,20));
+  }
+}
+function render(){
+  gL.textContent='';gP.textContent='';gN.textContent='';
+  const vl=visLinks(),an=anchors(vl);
+  vl.forEach(function(l,i){drawLink(l,an[i]);});
+  const nb=selected?neighbors(selected):new Set();
+  nodes.filter(vis).forEach(function(n){drawNode(n,nb);});
+}
+function schedule(){if(!raf)raf=requestAnimationFrame(function(){raf=0;render();});}
+function applyView(){root.setAttribute('transform','translate('+view.x+','+view.y+') scale('+view.k+')');}
+function bbox(){
+  const v=nodes.filter(vis);if(!v.length)return null;
+  let x1=1e9,y1=1e9,x2=-1e9,y2=-1e9;
+  v.forEach(function(n){const s=sz(n);x1=Math.min(x1,n.x-s.w/2);y1=Math.min(y1,n.y-s.h/2);x2=Math.max(x2,n.x+s.w/2);y2=Math.max(y2,n.y+s.h/2);});
+  return {x:x1,y:y1,w:x2-x1,h:y2-y1};
+}
+function fit(){
+  const b=bbox();if(!b)return;
+  const r=svg.getBoundingClientRect(),W=r.width||1200,Hh=r.height||700;
+  view.k=Math.max(0.12,Math.min(1.2,(W-90)/b.w,(Hh-90)/b.h));
+  view.x=(W-b.w*view.k)/2-b.x*view.k;view.y=(Hh-b.h*view.k)/2-b.y*view.k;applyView();
+}
+
+// --- Seitenleiste ---------------------------------------------------------
+function typeDot(parent,n){const i=H('span',{'class':'t'},parent);i.style.background=TYPES[n.type][2];return i;}
+function select(id){selected=id;render();side();}
+function side(){
+  const box=document.getElementById('side');box.textContent='';
+  if(selected){
+    const n=byId[selected];
+    H('button',{'class':'back'},box,'\u2190 alle Verbindungen').onclick=function(){select(null);};
+    const hd=H('div',{'class':'hd'},box);const d=H('span',{'class':'dot'},hd);d.style.background=TYPES[n.type][2];H('h2',{},hd,n.name);
+    const dl=H('dl',{},box);
+    [['IP',n.ip||'\u2013'],['Typ',TYPES[n.type][1]],['System',n.descr||'\u2013'],['Abfrage',n.scanned?'per SNMP ausgelesen':'nur per LLDP vom Nachbarn gemeldet']].forEach(function(r){H('dt',{},dl,r[0]);H('dd',{},dl,r[1]);});
+    const rows=links.filter(function(l){return l.a===n.id||l.b===n.id;}).map(function(l){return l.a===n.id?{p:l.aPort,o:byId[l.b],op:l.bPort}:{p:l.bPort,o:byId[l.a],op:l.aPort};}).sort(function(a,b){return nat(a.p,b.p);});
+    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Port','Nachbar','Nachbar-Port'].forEach(function(x){H('th',{},th,x);});
+    const tb=H('tbody',{},t);
+    rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);const c=H('td',{'class':'n'},tr);typeDot(c,r.o);c.appendChild(document.createTextNode(r.o.name));H('td',{'class':'p'},tr,r.op);
+      tr.onclick=function(){if(!show[r.o.type]){show[r.o.type]=true;chips();relayout();}select(r.o.id);};});
+    if(!rows.length)H('p',{'class':'hint'},box,'Keine LLDP-Nachbarn.');
+  }else{
+    H('h2',{},box,'Verbindungen');
+    H('p',{'class':'hint'},box,'Ger\u00e4t im Plan anklicken zeigt dessen Portbelegung. Knoten lassen sich verschieben.');
+    const inp=H('input',{type:'search',placeholder:'Filtern nach Ger\u00e4t, IP oder Port \u2026'},box);inp.value=filter;
+    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Ger\u00e4t','Port','Port','Ger\u00e4t'].forEach(function(x){H('th',{},th,x);});
+    const tb=H('tbody',{},t);
+    const fill=function(){
+      tb.textContent='';const f=filter.toLowerCase();
+      visLinks().forEach(function(l){const A=byId[l.a],B=byId[l.b];
+        if(f&&[A.name,A.ip,l.aPort,l.bPort,B.name,B.ip].join(' ').toLowerCase().indexOf(f)<0)return;
+        const tr=H('tr',{},tb);let c=H('td',{'class':'n'},tr);typeDot(c,A);c.appendChild(document.createTextNode(A.name));H('td',{'class':'p'},tr,l.aPort);H('td',{'class':'p'},tr,l.bPort);c=H('td',{'class':'n'},tr);typeDot(c,B);c.appendChild(document.createTextNode(B.name));
+        tr.onclick=function(){select(l.a);};});
+    };
+    inp.oninput=function(){filter=inp.value;fill();};fill();
+  }
+}
+
+// --- Kopfzeile ------------------------------------------------------------
+function chips(){
+  const box=document.getElementById('chips');box.textContent='';
+  Object.keys(TYPES).forEach(function(t){
+    const cnt=nodes.filter(function(n){return n.type===t;}).length;if(!cnt)return;
+    const b=H('button',{'class':'chip'+(show[t]?' on':'')},box);const i=H('i',{},b);i.style.background=TYPES[t][2];
+    b.appendChild(document.createTextNode(TYPES[t][0]+' '));H('b',{},b,String(cnt));
+    b.onclick=function(){show[t]=!show[t];if(selected&&!vis(byId[selected]))selected=null;chips();relayout();side();};
+  });
+}
+function relayout(){layout();loadPos();render();fit();}
+
+// --- Maus -----------------------------------------------------------------
+let drag=null;
+svg.addEventListener('pointerdown',function(e){
+  if(e.button!==0)return;
+  const g=e.target.closest?e.target.closest('.nd'):null;
+  try{svg.setPointerCapture(e.pointerId);}catch(x){}
+  if(g){const n=byId[g.getAttribute('data-id')];drag={n:n,sx:e.clientX,sy:e.clientY,ox:n.x,oy:n.y,moved:false};}
+  else{drag={pan:true,sx:e.clientX,sy:e.clientY,ox:view.x,oy:view.y,moved:false};svg.classList.add('grabbing');}
+});
+svg.addEventListener('pointermove',function(e){
+  if(!drag)return;
+  const dx=e.clientX-drag.sx,dy=e.clientY-drag.sy;
+  if(Math.abs(dx)+Math.abs(dy)>3)drag.moved=true;
+  if(!drag.moved)return;
+  if(drag.pan){view.x=drag.ox+dx;view.y=drag.oy+dy;applyView();}
+  else{drag.n.x=drag.ox+dx/view.k;drag.n.y=drag.oy+dy/view.k;schedule();}
+});
+function endDrag(){
+  if(!drag)return;const d=drag;drag=null;svg.classList.remove('grabbing');
+  if(d.pan){if(!d.moved&&selected)select(null);}
+  else if(d.moved)savePos();
+  else select(selected===d.n.id?null:d.n.id);
+}
+svg.addEventListener('pointerup',endDrag);
+svg.addEventListener('pointercancel',function(){drag=null;svg.classList.remove('grabbing');});
+svg.addEventListener('wheel',function(e){
+  e.preventDefault();
+  const r=svg.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+  const k=Math.min(3,Math.max(0.12,view.k*Math.exp(-e.deltaY*0.0015)));
+  view.x=mx-(mx-view.x)*(k/view.k);view.y=my-(my-view.y)*(k/view.k);view.k=k;applyView();
+},{passive:false});
+
+document.getElementById('bFit').onclick=fit;
+document.getElementById('bReset').onclick=function(){clearPos();layout();render();fit();};
+document.getElementById('bSvg').onclick=function(){
+  const b=bbox();if(!b)return;
+  const pad=40,c=svg.cloneNode(true),vb=[b.x-pad,b.y-pad,b.w+2*pad,b.h+2*pad];
+  c.querySelector('#root').removeAttribute('transform');
+  c.setAttribute('viewBox',vb.join(' '));c.setAttribute('width',vb[2]);c.setAttribute('height',vb[3]);c.removeAttribute('class');
+  const bg=c.querySelector('#bg');bg.setAttribute('x',vb[0]);bg.setAttribute('y',vb[1]);bg.setAttribute('width',vb[2]);bg.setAttribute('height',vb[3]);bg.setAttribute('fill','#ffffff');
+  c.querySelectorAll('.dim').forEach(function(x){x.classList.remove('dim');});
+  const blob=new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n'+new XMLSerializer().serializeToString(c)],{type:'image/svg+xml'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=DATA.name+'.svg';document.body.appendChild(a);a.click();a.remove();
+};
+window.addEventListener('resize',function(){if(!drag)fit();});
+
+document.title='Netzplan '+DATA.name;
+document.getElementById('ttl').textContent='Netzplan '+DATA.name;
+const cnt=function(t){return nodes.filter(function(n){return n.type===t;}).length;};
+document.getElementById('sub').textContent=cnt('switch')+' Switches \u00b7 '+nodes.length+' Ger\u00e4te \u00b7 '+links.length+' Verbindungen \u00b7 Stand '+DATA.generated;
+chips();relayout();side();
+})();
+</script>
+</body>
+</html>
+'@
+$html = Join-Path $OutDir ($Name + '.html')
+[System.IO.File]::WriteAllText($html, $template.Replace('__DATA__', $json), (New-Object System.Text.UTF8Encoding $false))
+
+# ---------------------------------------------------------------------------
+# Zusammenfassung
+# ---------------------------------------------------------------------------
+$swLinks = @($linkRows | Where-Object { $_.TypB -eq 'Switch' -or $_.TypB -eq 'Router/Firewall' })
+Write-Host ''
+Write-Host ("{0} Geraete, {1} Verbindungen ({2} zwischen Switchen/Routern):" -f $nodeList.Count, $linkList.Count, $swLinks.Count)
+$swLinks | Format-Table GeraetA, PortA, PortB, GeraetB, GemeldetVon -AutoSize | Out-String -Width 200 | Write-Host
+Write-Host "Netzplan:  $html"
+Write-Host "draw.io:   $drawio"
+Write-Host "CSV:       $csvLinks"
+Write-Host "           $csvDevs"
