@@ -87,7 +87,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 | Ursache | Abhilfe |
 |---|---|
-| Andere Community als `public` | `-Community <name>` angeben, mehrere mit Komma |
+| Andere Community als `public` | `-Snmp <name>` angeben, mehrere mit Komma |
 | SNMP nur von bestimmten Adressen erlaubt (ACL, Management-VLAN) | Skript von einem zugelassenen Rechner starten oder die Adresse am Switch freigeben |
 | Sehr altes Gerät | `-V1` probieren |
 | Gerät antwortet, zeigt aber 0 LLDP-Nachbarn | LLDP am Gerät prüfen |
@@ -107,7 +107,7 @@ Als Ziel reicht ein Netz oder ein einzelner Core-Switch. Switche, die ein abgefr
 .\Get-LldpTopology.ps1 192.168.10.0/24 -Name Musterfirma
 
 # Start am Core, zwei Communities probieren
-.\Get-LldpTopology.ps1 10.0.0.1 -Community public,kunde123 -Name Musterfirma
+.\Get-LldpTopology.ps1 10.0.0.1 -Snmp public,kunde123 -Name Musterfirma
 
 # Mehrere Netze und einzelne Adressen
 .\Get-LldpTopology.ps1 192.168.10.0/24,192.168.20.0/24,10.0.0.1 -Name Musterfirma
@@ -127,7 +127,7 @@ Als Ziel reicht ein Netz oder ein einzelner Core-Switch. Switche, die ein abgefr
 | Parameter | Bedeutung | Standard |
 |---|---|---|
 | `-Target` | IP-Adressen, Hostnamen oder Netze in CIDR-Schreibweise (`/16` bis `/32`), mehrere mit Komma | Pflicht |
-| `-Community` | SNMP-Community. Mehrere werden der Reihe nach probiert. | `public` |
+| `-Snmp` (lang: `-Community`) | SNMP-Community. Mehrere werden der Reihe nach probiert. | `public` |
 | `-Name` | Titel des Plans und Präfix der Ausgabedateien | `netzplan` |
 | `-OutDir` | Zielordner für die Ausgabe | aktueller Ordner |
 | `-NoCrawl` | per LLDP gefundene Nachbar-Switche nicht automatisch abfragen | aus |

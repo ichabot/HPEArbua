@@ -29,6 +29,7 @@
 
 .PARAMETER Community
     SNMP-Community. Mehrere werden der Reihe nach probiert. Standard: public
+    Kurzform: -Snmp
 
 .PARAMETER NoCrawl
     Nur die angegebenen Ziele abfragen, per LLDP gefundene Nachbar-Switche nicht nachziehen.
@@ -47,12 +48,13 @@
     .\Get-LldpTopology.ps1 192.168.10.0/24
 
 .EXAMPLE
-    .\Get-LldpTopology.ps1 10.0.0.1 -Community public,kunde123 -Name Kunde-XY -OutDir C:\Temp
+    .\Get-LldpTopology.ps1 10.0.0.1 -Snmp public,kunde123 -Name Kunde-XY -OutDir C:\Temp
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string[]]$Target,
+    [Alias('Snmp')]
     [string[]]$Community = @('public'),
     [string]$OutDir = (Get-Location).Path,
     [string]$Name = 'netzplan',
