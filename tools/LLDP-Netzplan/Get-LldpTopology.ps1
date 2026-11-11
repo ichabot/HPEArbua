@@ -1418,7 +1418,7 @@ main{flex:1;display:flex;min-height:0}
 #legend i{display:inline-block;width:26px;border-radius:2px}
 #legend .sep{width:1px;height:16px;background:#d5dbe3}
 aside{width:500px;max-width:45vw;background:#fff;border-left:1px solid #d5dbe3;display:flex;flex-direction:column;min-height:0}
-#side{overflow:auto;padding:16px 16px 24px}
+#side{overflow-y:auto;overflow-x:hidden;padding:16px 16px 24px}
 #side h2{font-size:15px;margin:0 0 2px}
 #side .hint{color:#687888;font-size:12px;margin:0 0 12px}
 #side .hd{display:flex;align-items:center;gap:8px;margin-bottom:8px}
@@ -1429,11 +1429,19 @@ aside{width:500px;max-width:45vw;background:#fff;border-left:1px solid #d5dbe3;d
 #side dd{margin:0;word-break:break-word}
 #side input{width:100%;padding:7px 10px;border:1px solid #c9d1db;border-radius:6px;font:inherit;margin-bottom:10px}
 #side input:focus{outline:2px solid #1668c7;outline-offset:-1px}
-table{border-collapse:collapse;width:100%;font-size:12.5px}
+table{border-collapse:collapse;width:100%;font-size:12.5px;table-layout:fixed}
 th{text-align:left;color:#687888;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px;padding:4px 6px;border-bottom:1px solid #d5dbe3;position:sticky;top:-16px;background:#fff}
-td{padding:5px 6px;border-bottom:1px solid #edf0f4;vertical-align:top}
-td.p{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px;white-space:nowrap}
-td.n{white-space:nowrap}
+td{padding:6px 6px;border-bottom:1px solid #edf0f4;vertical-align:top;overflow-wrap:anywhere}
+td.p,.dp{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px}
+td.lc{white-space:nowrap}
+.dn{display:flex;align-items:baseline;gap:6px}
+.dn .t{flex:none;margin-right:0}
+.dp{color:#4d5c6b;font-size:11.5px;padding-left:13px;margin-top:1px}
+.dp.sub{font-family:inherit;padding-left:0}
+table.lt th:nth-child(2),table.nb th:nth-child(2){width:98px}
+table.nb th:first-child{width:27%}
+table.ep th:first-child{width:22%}
+table.ep th:nth-child(2){width:44%}
 td.nt{color:#687888;font-size:11.5px}
 #side h3{font-size:13px;margin:20px 0 6px}
 table.ep tbody tr{cursor:default}
@@ -1643,7 +1651,8 @@ function fit(){
 
 // --- Seitenleiste ---------------------------------------------------------
 function typeDot(parent,n){const i=H('span',{'class':'t'},parent);i.style.background=TYPES[n.type][2];return i;}
-function linkCell(tr,l){const c=H('td',{'class':'n'},tr);if(l.label){const i=H('span',{'class':'t'},c);i.style.background=(MEDIA[l.media]||MEDIA[''])[1];i.style.borderRadius='2px';c.appendChild(document.createTextNode(l.label));if(l.detail)c.title=l.detail;}return c;}
+function devCell(tr,n,port){const c=H('td',{},tr),a=H('div',{'class':'dn'},c);typeDot(a,n);H('span',{},a,n.name);if(port)H('div',{'class':'dp'},c,port);return c;}
+function linkCell(tr,l){const c=H('td',{'class':'lc'},tr);if(l.label){const i=H('span',{'class':'t'},c);i.style.background=(MEDIA[l.media]||MEDIA[''])[1];i.style.borderRadius='2px';c.appendChild(document.createTextNode(l.label));if(l.detail)c.title=l.detail;}return c;}
 function legend(){
   const box=document.getElementById('legend'),vl=visLinks();box.textContent='';
   const used={};vl.forEach(function(l){used[l.media||'']=true;});
@@ -1664,29 +1673,29 @@ function side(){
     const dl=H('dl',{},box);
     [['IP',n.ip||'\u2013'],['Typ',TYPES[n.type][1]],['System',n.descr||'\u2013']].concat(n.ports?[['Ports',n.ports+' aktiv'],['Endger\u00e4te',n.macs+' MAC-Adressen an diesem Switch']]:[]).concat([['Abfrage',n.scanned?'per SNMP ausgelesen':'nur per LLDP vom Nachbarn gemeldet']]).forEach(function(r){H('dt',{},dl,r[0]);H('dd',{},dl,r[1]);});
     const rows=links.filter(function(l){return l.a===n.id||l.b===n.id;}).map(function(l){return l.a===n.id?{p:l.aPort,o:byId[l.b],op:l.bPort,l:l}:{p:l.bPort,o:byId[l.a],op:l.aPort,l:l};}).sort(function(a,b){return nat(a.p,b.p);});
-    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Port','Link','Nachbar','Nachbar-Port'].forEach(function(x){H('th',{},th,x);});
+    const t=H('table',{'class':'nb'},box),th=H('tr',{},H('thead',{},t));['Port','Link','Nachbar / Port'].forEach(function(x){H('th',{},th,x);});
     const tb=H('tbody',{},t);
-    rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);linkCell(tr,r.l);const c=H('td',{'class':'n'},tr);typeDot(c,r.o);c.appendChild(document.createTextNode(r.o.name));H('td',{'class':'p'},tr,r.op);
+    rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);linkCell(tr,r.l);devCell(tr,r.o,r.op);
       tr.onclick=function(){if(!show[r.o.type]){show[r.o.type]=true;chips();relayout();}select(r.o.id);};});
     if(!rows.length)H('p',{'class':'hint'},box,'Keine LLDP-Nachbarn.');
     const eps=(DATA.endpoints||[]).filter(function(e){return e.sw===n.id;}).sort(function(a,b){return nat(a.port,b.port)||nat(a.mac,b.mac);});
     if(eps.length){
       H('h3',{},box,'Endger\u00e4te laut MAC-Tabelle ('+eps.length+')');
-      const t2=H('table',{'class':'ep'},box),h2=H('tr',{},H('thead',{},t2));['Port','MAC','IP / Name','Hinweis'].forEach(function(x){H('th',{},h2,x);});
+      const t2=H('table',{'class':'ep'},box),h2=H('tr',{},H('thead',{},t2));['Port','Ger\u00e4t','Hinweis'].forEach(function(x){H('th',{},h2,x);});
       const b2=H('tbody',{},t2);
-      eps.forEach(function(e){const tr=H('tr',{},b2);H('td',{'class':'p'},tr,e.port);H('td',{'class':'p'},tr,e.mac);H('td',{},tr,[e.ip,e.name].filter(Boolean).join(' \u00b7 '));H('td',{'class':'nt'},tr,e.note);});
+      eps.forEach(function(e){const tr=H('tr',{},b2);H('td',{'class':'p'},tr,e.port);const c=H('td',{},tr);H('div',{'class':'dp sub',style:'font-family:ui-monospace,Consolas,Menlo,monospace;color:#17212b'},c,e.mac);const w=[e.name,e.ip].filter(Boolean).join(' \u00b7 ');if(w)H('div',{'class':'dp sub'},c,w);H('td',{'class':'nt'},tr,e.note);});
     }
   }else{
     H('h2',{},box,'Verbindungen');
     H('p',{'class':'hint'},box,'Ger\u00e4t im Plan anklicken zeigt dessen Portbelegung. Knoten lassen sich verschieben.');
     const inp=H('input',{type:'search',placeholder:'Filtern nach Ger\u00e4t, IP oder Port \u2026'},box);inp.value=filter;
-    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Ger\u00e4t','Port','Link','Port','Ger\u00e4t'].forEach(function(x){H('th',{},th,x);});
+    const t=H('table',{'class':'lt'},box),th=H('tr',{},H('thead',{},t));['Von','Link','Nach'].forEach(function(x){H('th',{},th,x);});
     const tb=H('tbody',{},t);
     const fill=function(){
       tb.textContent='';const f=filter.toLowerCase();
       visLinks().forEach(function(l){const A=byId[l.a],B=byId[l.b];
         if(f&&[A.name,A.ip,l.aPort,l.label,l.detail,l.bPort,B.name,B.ip].join(' ').toLowerCase().indexOf(f)<0)return;
-        const tr=H('tr',{},tb);let c=H('td',{'class':'n'},tr);typeDot(c,A);c.appendChild(document.createTextNode(A.name));H('td',{'class':'p'},tr,l.aPort);linkCell(tr,l);H('td',{'class':'p'},tr,l.bPort);c=H('td',{'class':'n'},tr);typeDot(c,B);c.appendChild(document.createTextNode(B.name));
+        const tr=H('tr',{},tb);devCell(tr,A,l.aPort);linkCell(tr,l);devCell(tr,B,l.bPort);
         tr.onclick=function(){select(l.a);};});
     };
     inp.oninput=function(){filter=inp.value;fill();};fill();
