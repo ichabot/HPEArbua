@@ -9,7 +9,7 @@ Die Tools sind für den Einsatz in beliebigen Kundenumgebungen gebaut. Sie entha
 | Tool | Zweck |
 |---|---|
 | [CX-Wartung](tools/CX-Wartung/) | Firmware-Updates in Wellen mit Vorabprüfung, Backup, Hostname, Gateway/DNS/NTP, STP-Prioritäten, VLANs/Trunks, Banner, Inventar, Passwortwechsel |
-| [LLDP-Netzplan](tools/LLDP-Netzplan/) | Liest per SNMP die LLDP-Nachbarn aller Switche und erzeugt einen Netzwerkplan (HTML, draw.io, CSV) mit Port-zu-Port-Verbindungen. Nur lesend, herstellerunabhängig. |
+| [LLDP-Netzplan](tools/LLDP-Netzplan/) | Liest per SNMP die LLDP-Nachbarn aller Switche und erzeugt einen Netzwerkplan (HTML, draw.io, CSV) mit Port-zu-Port-Verbindungen, Geschwindigkeit und Medium je Link (`10G LWL`, `10G DAC`, `1G Kupfer`). Nur lesend, herstellerunabhängig. |
 
 Weitere Tools folgen jeweils in einem eigenen Ordner unter `tools/`.
 

@@ -11,6 +11,7 @@
       2. Bei jedem antwortenden Geraet die LLDP-Tabellen auslesen
       3. Per LLDP gemeldete Nachbar-Switche automatisch mit abfragen (abschaltbar)
       4. Links zusammenfuehren (beide Seiten eines Links = ein Eintrag)
+      5. Je Link Geschwindigkeit und Medium bestimmen (z. B. "10G LWL", "10G DAC", "1G Kupfer")
 
     Ausgabe im Zielordner:
       <Name>.html          interaktiver Netzplan (im Browser oeffnen)
@@ -143,6 +144,13 @@ function ConvertTo-Int([byte[]]$B) {
     return $v
 }
 
+function ConvertTo-UInt([byte[]]$B) {
+    if ($null -eq $B -or $B.Length -eq 0) { return 0 }
+    [long]$v = 0
+    foreach ($x in $B) { $v = ($v -shl 8) -bor $x }
+    return $v
+}
+
 function ConvertFrom-BerOid([byte[]]$Buf, [int]$Start, [int]$Len) {
     if ($Len -lt 1) { return '' }
     $sb = New-Object System.Text.StringBuilder
@@ -242,6 +250,37 @@ function Get-SnmpWalk([string]$Ip, [string]$Comm, [string]$Base) {
         if ($done) { break }
     }
     return , $res
+}
+
+# Walk als Tabelle: OID-Rest hinter der Basis -> VarBind
+function Get-WalkTable([string]$Ip, [string]$Comm, [string]$Base) {
+    $t = @{}
+    $len = $Base.Length + 1
+    foreach ($vb in (Get-SnmpWalk $Ip $Comm $Base)) { $t[$vb.Oid.Substring($len)] = $vb }
+    return $t
+}
+
+# Mehrere Einzelwerte per GET holen (in Bloecken), OID -> VarBind
+function Get-SnmpValues([string]$Ip, [string]$Comm, [string[]]$Oids) {
+    $out = @{}
+    for ($i = 0; $i -lt $Oids.Count; $i += 8) {
+        $chunk = @($Oids[$i..([math]::Min($i + 7, $Oids.Count - 1))])
+        $r = Invoke-Snmp $Ip $Comm 0xA0 $chunk 0
+        if ($null -eq $r) { continue }
+        if ($r.Error -eq 0) {
+            foreach ($vb in $r.VarBinds) { if ($vb.Tag -lt 0x80) { $out[$vb.Oid] = $vb } }
+        }
+        elseif ($chunk.Count -gt 1) {
+            # SNMP v1 lehnt den ganzen Block ab, wenn ein Wert fehlt -> einzeln holen
+            foreach ($o in $chunk) {
+                $r1 = Invoke-Snmp $Ip $Comm 0xA0 @($o) 0
+                if ($null -ne $r1 -and $r1.Error -eq 0) {
+                    foreach ($vb in $r1.VarBinds) { if ($vb.Tag -lt 0x80) { $out[$vb.Oid] = $vb } }
+                }
+            }
+        }
+    }
+    return $out
 }
 
 # Schickt an alle Adressen gleichzeitig eine sysName/sysDescr-Abfrage und sammelt die Antworten
@@ -356,6 +395,209 @@ function Get-SortKey([string]$s) {
     return [regex]::Replace($s, '\d+', { param($m) $m.Value.PadLeft(6, '0') })
 }
 
+# ---------------------------------------------------------------------------
+# Geschwindigkeit und Medium eines Ports
+# ---------------------------------------------------------------------------
+# MAU-Typen nach IANA-MAU-MIB (dot3MauType, Stand 2017-04-10). Klassen:
+# kupfer = Twisted Pair, lwl = Glasfaser, dac = Twinax/Direct Attach,
+# sfp = steckbares Modul mit unbekanntem Medium, bp = Backplane
+$script:MauTable = @{}
+function Add-Mau([string]$MauName, [string]$Class, [int[]]$Nums) {
+    foreach ($n in $Nums) { $script:MauTable[$n] = @($MauName, $Class) }
+}
+Add-Mau '10BASE-T' 'kupfer' 5, 10, 11
+Add-Mau '10BASE-F' 'lwl' 6, 7, 8, 12, 13
+Add-Mau '100BASE-T4' 'kupfer' 14
+Add-Mau '100BASE-TX' 'kupfer' 15, 16
+Add-Mau '100BASE-FX' 'lwl' 17, 18
+Add-Mau '100BASE-T2' 'kupfer' 19, 20
+Add-Mau '1000BASE-X' 'sfp' 21, 22
+Add-Mau '1000BASE-LX' 'lwl' 23, 24
+Add-Mau '1000BASE-SX' 'lwl' 25, 26
+Add-Mau '1000BASE-CX' 'dac' 27, 28
+Add-Mau '1000BASE-T' 'kupfer' 29, 30
+Add-Mau '10GBASE-X' 'sfp' 31
+Add-Mau '10GBASE-LX4' 'lwl' 32
+Add-Mau '10GBASE-R' 'sfp' 33
+Add-Mau '10GBASE-ER' 'lwl' 34
+Add-Mau '10GBASE-LR' 'lwl' 35
+Add-Mau '10GBASE-SR' 'lwl' 36
+Add-Mau '10GBASE-W' 'sfp' 37
+Add-Mau '10GBASE-EW' 'lwl' 38
+Add-Mau '10GBASE-LW' 'lwl' 39
+Add-Mau '10GBASE-SW' 'lwl' 40
+Add-Mau '10GBASE-CX4' 'dac' 41
+Add-Mau '100BASE-BX10' 'lwl' 44, 45
+Add-Mau '100BASE-LX10' 'lwl' 46
+Add-Mau '1000BASE-BX10' 'lwl' 47, 48
+Add-Mau '1000BASE-LX10' 'lwl' 49
+Add-Mau '1000BASE-PX' 'lwl' 50, 51, 52, 53, 80, 81, 82, 83
+Add-Mau '10GBASE-T' 'kupfer' 54
+Add-Mau '10GBASE-LRM' 'lwl' 55
+Add-Mau '1000BASE-KX' 'bp' 56
+Add-Mau '10GBASE-KX4' 'bp' 57
+Add-Mau '10GBASE-KR' 'bp' 58
+Add-Mau '10GBASE-PR' 'lwl' 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 84, 85, 86, 87
+Add-Mau '40GBASE-KR4' 'bp' 70
+Add-Mau '40GBASE-CR4' 'dac' 71
+Add-Mau '40GBASE-SR4' 'lwl' 72
+Add-Mau '40GBASE-FR' 'lwl' 73
+Add-Mau '40GBASE-LR4' 'lwl' 74
+Add-Mau '100GBASE-CR10' 'dac' 75
+Add-Mau '100GBASE-SR10' 'lwl' 76
+Add-Mau '100GBASE-LR4' 'lwl' 77
+Add-Mau '100GBASE-ER4' 'lwl' 78
+Add-Mau '1000BASE-T1' 'kupfer' 79
+Add-Mau '25GBASE-CR' 'dac' 88, 89
+Add-Mau '25GBASE-KR' 'bp' 90, 91
+Add-Mau '25GBASE-R' 'sfp' 92
+Add-Mau '25GBASE-SR' 'lwl' 93
+Add-Mau '25GBASE-T' 'kupfer' 94
+Add-Mau '40GBASE-ER4' 'lwl' 95
+Add-Mau '40GBASE-R' 'sfp' 96
+Add-Mau '40GBASE-T' 'kupfer' 97
+Add-Mau '100GBASE-CR4' 'dac' 98
+Add-Mau '100GBASE-KR4' 'bp' 99
+Add-Mau '100GBASE-KP4' 'bp' 100
+Add-Mau '100GBASE-R' 'sfp' 101
+Add-Mau '100GBASE-SR4' 'lwl' 102
+
+$script:MediaText = @{ lwl = 'LWL'; dac = 'DAC'; aoc = 'AOC'; kupfer = 'Kupfer'; sfp = 'SFP'; bp = 'Backplane' }
+
+function Test-SpecificMedia([string]$Class) {
+    return ($Class -eq 'lwl' -or $Class -eq 'dac' -or $Class -eq 'aoc' -or $Class -eq 'kupfer')
+}
+
+# Typbezeichnung eines Transceivers (z. B. "SFP+SR", "SFP+DAC3", "1000SX") einordnen
+function Get-XcvrClass([string]$Text) {
+    if (-not $Text) { return '' }
+    $t = $Text.ToUpper()
+    if ($t -match 'AOC|ACTIVE OPTICAL') { return 'aoc' }
+    if ($t -match 'DAC|DIRECT|TWINAX|(?<![A-Z])DA\d|(?<![A-Z])CR\d*(?![A-Z])') { return 'dac' }
+    if ($t -match '(?<![A-Z])(LRM|SR|LR|ER|ZR|SX|LX|LH|BX|ZX|EX|FX|PSM|CWDM|DWDM)\d*(?![A-Z])|FIBER|MMF|SMF|(?<![A-Z])LC(?![A-Z])') { return 'lwl' }
+    if ($t -match 'RJ-?45|BASE-?T(?![A-Z])|(?<![A-Z])T(?![A-Z])') { return 'kupfer' }
+    if ($t -match 'COPPER') { return 'dac' }
+    return 'sfp'
+}
+
+# Medium eines Link-Endes. Rang: Transceiver-Typ 5, eigener MAU-Typ 4, vom Nachbarn
+# gemeldeter MAU-Typ 3, unspezifisch (nur "SFP"/Backplane) 2 bzw. 1, unbekannt 0
+function Get-EndMedia([string]$XcvrHint, [string]$XcvrShow, [int]$Mau, [bool]$Local) {
+    $mName = ''; $mClass = ''; $mSpeed = 0
+    if ($Mau -gt 0 -and $script:MauTable.ContainsKey($Mau)) {
+        $mName = $script:MauTable[$Mau][0]; $mClass = $script:MauTable[$Mau][1]
+        if ($mName -match '^(\d+)(G?)BASE') { $mSpeed = [long]$Matches[1]; if ($Matches[2]) { $mSpeed = $mSpeed * 1000 } }
+    }
+    $xClass = Get-XcvrClass $XcvrHint
+    $spec = 3; $gen = 1
+    if ($Local) { $spec = 4; $gen = 2 }
+    if (Test-SpecificMedia $xClass) { return [pscustomobject]@{ Class = $xClass; Detail = $XcvrShow; Rank = 5; Speed = $mSpeed } }
+    if (Test-SpecificMedia $mClass) { return [pscustomobject]@{ Class = $mClass; Detail = $mName; Rank = $spec; Speed = $mSpeed } }
+    if ($xClass) { return [pscustomobject]@{ Class = 'sfp'; Detail = $XcvrShow; Rank = $gen; Speed = $mSpeed } }
+    if ($mClass) { return [pscustomobject]@{ Class = $mClass; Detail = $mName; Rank = $gen; Speed = $mSpeed } }
+    return [pscustomobject]@{ Class = ''; Detail = ''; Rank = 0; Speed = 0 }
+}
+
+function Format-Speed([long]$Mbps) {
+    if ($Mbps -le 0) { return '' }
+    if ($Mbps -lt 1000) { return "$($Mbps)M" }
+    return "$([math]::Round($Mbps / 1000, 1))G"
+}
+
+# Fuer die LLDP-Ports eines Geraets: Geschwindigkeit (IF-MIB), MAU-Typ (LLDP-dot3 / MAU-MIB)
+# und Transceiver-Typ (HPE ArubaOS-Switch und AOS-CX) holen
+function Get-PortDetails([string]$Ip, [string]$Comm, $Ports, [string[]]$Nums) {
+    $res = @{}
+    foreach ($n in $Nums) { $res[$n] = @{ Speed = [long]0; Mau = 0; Xcvr = ''; XcvrHint = '' } }
+    if ($Nums.Count -eq 0) { return $res }
+
+    # LLDP-Portnummer -> ifIndex: ueber Portnamen, sonst gilt Portnummer = ifIndex
+    $ifIdx = @{}
+    $tables = New-Object System.Collections.ArrayList
+    foreach ($base in @('1.3.6.1.2.1.31.1.1.1.1', '1.3.6.1.2.1.2.2.1.2')) {
+        if ($ifIdx.Count -eq $Nums.Count) { break }
+        $tbl = Get-WalkTable $Ip $Comm $base
+        [void]$tables.Add($tbl)
+        $byName = @{}
+        foreach ($k in $tbl.Keys) { $byName[(ConvertTo-Text $tbl[$k].Bytes).ToLower()] = $k }
+        foreach ($n in $Nums) {
+            if ($ifIdx.ContainsKey($n)) { continue }
+            $p = $Ports[$n]
+            if (-not $p) { continue }
+            foreach ($cand in @((Format-LldpId $p.Sub $p.Id $false), $p.Desc)) {
+                if ($cand -and $byName.ContainsKey($cand.ToLower())) { $ifIdx[$n] = $byName[$cand.ToLower()]; break }
+            }
+        }
+    }
+    foreach ($n in $Nums) {
+        if ($ifIdx.ContainsKey($n)) { continue }
+        foreach ($tbl in $tables) { if ($tbl.ContainsKey($n)) { $ifIdx[$n] = $n; break } }
+    }
+    $numByIf = @{}
+    foreach ($n in $ifIdx.Keys) { $numByIf[$ifIdx[$n]] = $n }
+
+    # Geschwindigkeit: ifHighSpeed (Mbit/s), ersatzweise ifSpeed (bit/s)
+    if ($numByIf.Count -gt 0) {
+        $hs = '1.3.6.1.2.1.31.1.1.1.15.'
+        $vals = Get-SnmpValues $Ip $Comm @($numByIf.Keys | ForEach-Object { $hs + $_ })
+        foreach ($o in $vals.Keys) { $i = $o.Substring($hs.Length); if ($numByIf.ContainsKey($i)) { $res[$numByIf[$i]].Speed = [long](ConvertTo-UInt $vals[$o].Bytes) } }
+        $rest = @($numByIf.Keys | Where-Object { $res[$numByIf[$_]].Speed -le 0 })
+        if ($rest.Count -gt 0) {
+            $sp = '1.3.6.1.2.1.2.2.1.5.'
+            $vals = Get-SnmpValues $Ip $Comm @($rest | ForEach-Object { $sp + $_ })
+            foreach ($o in $vals.Keys) { $i = $o.Substring($sp.Length); if ($numByIf.ContainsKey($i)) { $res[$numByIf[$i]].Speed = [long][math]::Round((ConvertTo-UInt $vals[$o].Bytes) / 1000000) } }
+        }
+    }
+
+    # MAU-Typ: LLDP-802.3-Erweiterung (nach LLDP-Portnummer), sonst MAU-MIB (nach ifIndex)
+    $mau = Get-WalkTable $Ip $Comm '1.0.8802.1.1.2.1.5.4623.1.2.1.1.4'
+    foreach ($n in $Nums) { if ($mau.ContainsKey($n)) { $res[$n].Mau = [int](ConvertTo-UInt $mau[$n].Bytes) } }
+    if (@($numByIf.Values | Where-Object { $res[$_].Mau -le 0 }).Count -gt 0) {
+        $mm = Get-WalkTable $Ip $Comm '1.3.6.1.2.1.26.2.1.1.3'
+        foreach ($k in $mm.Keys) {
+            $vb = $mm[$k]
+            $if = $k.Split('.')[0]
+            if ($vb.Tag -ne 0x06 -or -not $numByIf.ContainsKey($if)) { continue }
+            $n = $numByIf[$if]
+            if ($res[$n].Mau -gt 0) { continue }
+            $oid = ConvertFrom-BerOid $vb.Bytes 0 $vb.Bytes.Length
+            if ($oid.StartsWith('1.3.6.1.2.1.26.4.')) { $res[$n].Mau = [int]($oid.Split('.')[-1]) }
+        }
+    }
+
+    # Transceiver-Typ, indiziert nach ifIndex
+    if ($numByIf.Count -gt 0) {
+        # ArubaOS-Switch / ProCurve: HP-ICF-TRANSCEIVER-MIB hpicfXcvrType
+        $x = Get-WalkTable $Ip $Comm '1.3.6.1.4.1.11.2.14.11.5.1.82.1.1.1.1.5'
+        foreach ($k in $x.Keys) {
+            if (-not $numByIf.ContainsKey($k)) { continue }
+            $t = ConvertTo-Text $x[$k].Bytes
+            $res[$numByIf[$k]].Xcvr = $t; $res[$numByIf[$k]].XcvrHint = $t
+        }
+        if ($x.Count -eq 0) {
+            # AOS-CX: ARUBAWIRED-PM-MIB arubaWiredPmXcvrType, -Description, -CableType
+            $cx = '1.3.6.1.4.1.47196.4.1.1.3.27.1.1.1.1.'
+            $xt = Get-WalkTable $Ip $Comm ($cx + '7')
+            if ($xt.Count -gt 0) {
+                $xd = Get-WalkTable $Ip $Comm ($cx + '3')
+                $xc = Get-WalkTable $Ip $Comm ($cx + '11')
+                foreach ($k in $xt.Keys) {
+                    if (-not $numByIf.ContainsKey($k)) { continue }
+                    $t = ConvertTo-Text $xt[$k].Bytes
+                    $d = ''; $c = ''
+                    if ($xd.ContainsKey($k)) { $d = ConvertTo-Text $xd[$k].Bytes }
+                    if ($xc.ContainsKey($k)) { $c = ConvertTo-Text $xc[$k].Bytes }
+                    $show = $t
+                    if (-not $show) { $show = $d }
+                    $res[$numByIf[$k]].Xcvr = $show
+                    $res[$numByIf[$k]].XcvrHint = ("$t $d $c").Trim()
+                }
+            }
+        }
+    }
+    return $res
+}
+
 function Expand-Target([string[]]$Items) {
     $out = New-Object System.Collections.ArrayList
     foreach ($raw in $Items) {
@@ -455,6 +697,16 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
         }
     }
 
+    # Geschwindigkeit / Medium der Ports mit Nachbarn
+    $det = @{}; $advMau = @{}
+    if ($order.Count -gt 0) {
+        $nums = @($order | ForEach-Object { $nb[$_].PortNum } | Select-Object -Unique)
+        $det = Get-PortDetails $Ip $comm $ports $nums
+        # MAU-Typ, den der Nachbar fuer sein Ende meldet
+        $adv = Get-WalkTable $Ip $comm '1.0.8802.1.1.2.1.5.4623.1.3.1.1.4'
+        foreach ($k in $adv.Keys) { $advMau[$k] = [int](ConvertTo-UInt $adv[$k].Bytes) }
+    }
+
     $key = Format-LldpId $chSub $chId $true
     if (-not $key) { $key = 'ip:' + $Ip }
     $devName = $Sys.SysName
@@ -484,6 +736,13 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
         if ($null -eq $rCaps -or $rCaps.Length -eq 0 -or $rCaps[0] -eq 0) { $rCaps = $e.CapS }
         $rName = $e.Name
         if (-not $rName) { $rName = $rKey }
+        $speed = [long]0
+        $locMedia = Get-EndMedia '' '' 0 $true
+        $pd = $det[$e.PortNum]
+        if ($pd) { $speed = $pd.Speed; $locMedia = Get-EndMedia $pd.XcvrHint $pd.Xcvr $pd.Mau $true }
+        $remMau = 0
+        if ($advMau.ContainsKey($k)) { $remMau = $advMau[$k] }
+        $remMedia = Get-EndMedia '' '' $remMau $false
 
         [void]$neighbors.Add([pscustomobject]@{
                 LocalPort    = $localLabel
@@ -495,6 +754,9 @@ function Get-DeviceLldp([string]$Ip, $Sys) {
                 Descr        = $e.Desc
                 Type         = (Get-NodeType $rCaps $false)
                 Mgmt         = $e.Mgmt
+                Speed        = $speed
+                LocMedia     = $locMedia
+                RemMedia     = $remMedia
             })
     }
 
@@ -602,13 +864,45 @@ foreach ($d in $devices) {
         if ($links.Contains($lk)) {
             # Link wurde schon von der Gegenseite gemeldet: eigene Portbezeichnung hat Vorrang
             $l = $links[$lk]
-            if ($l.AEnd -eq $ea) { $l.APort = $n.LocalPort } else { $l.BPort = $n.LocalPort }
+            if ($l.AEnd -eq $ea) {
+                $l.APort = $n.LocalPort
+                if ($n.LocMedia.Rank -gt $l.AMedia.Rank) { $l.AMedia = $n.LocMedia }
+                if ($n.RemMedia.Rank -gt $l.BMedia.Rank) { $l.BMedia = $n.RemMedia }
+            }
+            else {
+                $l.BPort = $n.LocalPort
+                if ($n.LocMedia.Rank -gt $l.BMedia.Rank) { $l.BMedia = $n.LocMedia }
+                if ($n.RemMedia.Rank -gt $l.AMedia.Rank) { $l.AMedia = $n.RemMedia }
+            }
+            if ($l.Speed -le 0) { $l.Speed = $n.Speed }
             $l.Both = $true
         }
         else {
-            $links[$lk] = [pscustomobject]@{ AKey = $d.Key; AEnd = $ea; APort = $n.LocalPort; BKey = $rk; BEnd = $eb; BPort = $n.Port; Both = $false }
+            $links[$lk] = [pscustomobject]@{
+                AKey = $d.Key; AEnd = $ea; APort = $n.LocalPort; BKey = $rk; BEnd = $eb; BPort = $n.Port; Both = $false
+                Speed = $n.Speed; AMedia = $n.LocMedia; BMedia = $n.RemMedia
+                SpeedText = ''; Media = ''; MediaText = ''; Detail = ''; Label = ''
+            }
         }
     }
+}
+
+# Je Link: Geschwindigkeit und Medium aus beiden Enden zusammenfuehren
+foreach ($l in $links.Values) {
+    $m = $l.AMedia; $o = $l.BMedia
+    if ($o.Rank -gt $m.Rank) { $m = $l.BMedia; $o = $l.AMedia }
+    if ($l.Speed -le 0) { $l.Speed = $m.Speed }
+    if ($l.Speed -le 0) { $l.Speed = $o.Speed }
+    $l.SpeedText = Format-Speed $l.Speed
+    $l.Media = $m.Class
+    $l.Detail = $m.Detail
+    if ($m.Class) { $l.MediaText = $script:MediaText[$m.Class] }
+    # beide Enden gleich sicher, aber unterschiedlich (z. B. Medienkonverter): beides nennen
+    if ($o.Rank -eq $m.Rank -and $m.Rank -ge 3 -and $o.Class -ne $m.Class) {
+        $l.MediaText = $script:MediaText[$l.AMedia.Class] + '/' + $script:MediaText[$l.BMedia.Class]
+        $l.Detail = $l.AMedia.Detail + ' / ' + $l.BMedia.Detail
+    }
+    $l.Label = ("$($l.SpeedText) $($l.MediaText)").Trim()
 }
 
 $i = 0
@@ -630,7 +924,9 @@ $linkRows = foreach ($l in $linkList) {
     [pscustomobject]@{
         GeraetA   = $a.Name; IpA = $a.Ip; PortA = $l.APort
         PortB     = $l.BPort; GeraetB = $b.Name; IpB = $b.Ip
-        TypB      = $typeText[$b.Type]; GemeldetVon = $src
+        TypB      = $typeText[$b.Type]
+        Link      = $l.Label; Geschwindigkeit = $l.SpeedText; Medium = $l.MediaText; Detail = $l.Detail
+        GemeldetVon = $src
     }
 }
 $devRows = foreach ($n in ($nodeList | Sort-Object { Get-SortKey $_.Name })) {
@@ -702,7 +998,7 @@ $dIds = @{}
 foreach ($n in $dNodes) { $dIds[$n.Id] = $true }
 $dLinks = @(foreach ($l in $linkList) {
         $a = $nodes[$l.AKey].Id; $b = $nodes[$l.BKey].Id
-        if ($dIds.ContainsKey($a) -and $dIds.ContainsKey($b)) { [pscustomobject]@{ A = $a; B = $b; APort = $l.APort; BPort = $l.BPort } }
+        if ($dIds.ContainsKey($a) -and $dIds.ContainsKey($b)) { [pscustomobject]@{ A = $a; B = $b; APort = $l.APort; BPort = $l.BPort; Label = $l.Label; Media = $l.Media; Speed = $l.Speed } }
     })
 $pos = Get-Layout $dNodes $dLinks
 $styleByType = @{
@@ -712,6 +1008,7 @@ $styleByType = @{
     phone  = 'fillColor=#ffe6cc;strokeColor=#d79b00;'
     other  = 'fillColor=#f5f5f5;strokeColor=#666666;'
 }
+$mediaColor = @{ lwl = '#e07c0c'; aoc = '#e07c0c'; dac = '#111827'; kupfer = '#4f7396'; sfp = '#8b5cf6'; bp = '#0f766e'; '' = '#9aa5b1' }
 $x = New-Object System.Text.StringBuilder
 [void]$x.Append('<mxfile host="app.diagrams.net"><diagram name="' + (ConvertTo-XmlText $Name) + '" id="netzplan">')
 [void]$x.Append('<mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>')
@@ -735,7 +1032,9 @@ foreach ($l in $dLinks) {
     if ([string]::CompareOrdinal($l.A, $l.B) -le 0) { $pk = $l.A + '|' + $l.B; $p1 = $pos[$l.A]; $p2 = $pos[$l.B] } else { $pk = $l.B + '|' + $l.A; $p1 = $pos[$l.B]; $p2 = $pos[$l.A] }
     if ($pairIdx.ContainsKey($pk)) { $pairIdx[$pk]++ } else { $pairIdx[$pk] = 0 }
     $geo = '<mxGeometry relative="1" as="geometry"/>'
-    $style = 'endArrow=none;html=1;rounded=0;strokeWidth=2;strokeColor=#5b6b7c;'
+    $sw = 2
+    if ($l.Speed -ge 25000) { $sw = 5 } elseif ($l.Speed -ge 10000) { $sw = 4 } elseif ($l.Speed -ge 2500) { $sw = 3 } elseif ($l.Speed -gt 0 -and $l.Speed -lt 1000) { $sw = 1 }
+    $style = 'endArrow=none;html=1;rounded=0;fontSize=10;fontStyle=1;labelBackgroundColor=#ffffff;strokeWidth=' + $sw + ';strokeColor=' + $mediaColor[$l.Media] + ';fontColor=' + $mediaColor[$l.Media] + ';'
     if ($pairCount[$pk] -gt 1) {
         # parallele Links (LAG) leicht auseinanderziehen
         $off = ($pairIdx[$pk] - ($pairCount[$pk] - 1) / 2) * 40
@@ -745,10 +1044,10 @@ foreach ($l in $dLinks) {
         $geo = '<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="' + $mx + '" y="' + $my + '"/></Array></mxGeometry>'
         $style += 'curved=1;'
     }
-    [void]$x.Append(('<mxCell id="e{0}" style="{1}" edge="1" parent="1" source="{2}" target="{3}">{4}</mxCell>' -f $e, $style, $l.A, $l.B, $geo))
-    $ls = 'edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontFamily=Courier New;'
-    [void]$x.Append(('<mxCell id="e{0}a" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="-0.6" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.APort)), $ls))
-    [void]$x.Append(('<mxCell id="e{0}b" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="0.6" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.BPort)), $ls))
+    [void]$x.Append(('<mxCell id="e{0}" value="{5}" style="{1}" edge="1" parent="1" source="{2}" target="{3}">{4}</mxCell>' -f $e, $style, $l.A, $l.B, $geo, (ConvertTo-XmlText (ConvertTo-XmlText $l.Label))))
+    $ls = 'edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontStyle=0;fontColor=#27323e;fontFamily=Courier New;'
+    [void]$x.Append(('<mxCell id="e{0}a" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="-0.7" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.APort)), $ls))
+    [void]$x.Append(('<mxCell id="e{0}b" value="{1}" style="{2}" vertex="1" connectable="0" parent="e{0}"><mxGeometry x="0.7" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry></mxCell>' -f $e, (ConvertTo-XmlText (ConvertTo-XmlText $l.BPort)), $ls))
 }
 [void]$x.Append('</root></mxGraphModel></diagram></mxfile>')
 $drawio = Join-Path $OutDir ($Name + '.drawio')
@@ -774,7 +1073,7 @@ $jNodes = foreach ($n in $nodeList) {
     '{"id":' + (ConvertTo-JsString $n.Id) + ',"name":' + (ConvertTo-JsString $n.Name) + ',"ip":' + (ConvertTo-JsString $n.Ip) + ',"descr":' + (ConvertTo-JsString $n.Descr) + ',"type":' + (ConvertTo-JsString $n.Type) + ',"scanned":' + $sc + '}'
 }
 $jLinks = foreach ($l in $linkList) {
-    '{"a":' + (ConvertTo-JsString $nodes[$l.AKey].Id) + ',"aPort":' + (ConvertTo-JsString $l.APort) + ',"b":' + (ConvertTo-JsString $nodes[$l.BKey].Id) + ',"bPort":' + (ConvertTo-JsString $l.BPort) + '}'
+    '{"a":' + (ConvertTo-JsString $nodes[$l.AKey].Id) + ',"aPort":' + (ConvertTo-JsString $l.APort) + ',"b":' + (ConvertTo-JsString $nodes[$l.BKey].Id) + ',"bPort":' + (ConvertTo-JsString $l.BPort) + ',"speed":' + [long]$l.Speed + ',"media":' + (ConvertTo-JsString $l.Media) + ',"label":' + (ConvertTo-JsString $l.Label) + ',"detail":' + (ConvertTo-JsString $l.Detail) + '}'
 }
 $json = '{"name":' + (ConvertTo-JsString $Name) + ',"generated":' + (ConvertTo-JsString (Get-Date -Format 'dd.MM.yyyy HH:mm')) + ',"nodes":[' + (@($jNodes) -join ',') + '],"links":[' + (@($jLinks) -join ',') + ']}'
 
@@ -802,9 +1101,14 @@ header .sub{font-size:12px;color:#9fb0c5;margin-top:1px}
 .btn{padding:5px 11px;border-radius:6px;border:1px solid #33455c;background:#1d2c42;color:#fff;font:inherit;font-size:12px;cursor:pointer}
 .btn:hover,.chip:hover{border-color:#7f9cc4}
 main{flex:1;display:flex;min-height:0}
-#cv{flex:1;min-width:0;height:100%;display:block;cursor:grab;touch-action:none;background:#eef1f5}
+#cvwrap{flex:1;min-width:0;display:flex;flex-direction:column}
+#cv{flex:1;min-height:0;width:100%;display:block;cursor:grab;touch-action:none;background:#eef1f5}
 #cv.grabbing{cursor:grabbing}
-aside{width:430px;max-width:45vw;background:#fff;border-left:1px solid #d5dbe3;display:flex;flex-direction:column;min-height:0}
+#legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 18px;padding:7px 16px;background:#fff;border-top:1px solid #d5dbe3;font-size:12px;color:#27323e}
+#legend span{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+#legend i{display:inline-block;width:26px;border-radius:2px}
+#legend .sep{width:1px;height:16px;background:#d5dbe3}
+aside{width:500px;max-width:45vw;background:#fff;border-left:1px solid #d5dbe3;display:flex;flex-direction:column;min-height:0}
 #side{overflow:auto;padding:16px 16px 24px}
 #side h2{font-size:15px;margin:0 0 2px}
 #side .hint{color:#687888;font-size:12px;margin:0 0 12px}
@@ -825,7 +1129,7 @@ tbody tr{cursor:pointer}
 tbody tr:hover{background:#f2f6fb}
 td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .back{background:none;border:0;color:#1668c7;font:inherit;font-size:12.5px;padding:0;margin-bottom:10px;cursor:pointer}
-@media print{header .chips,header .btns,aside{display:none}header{background:#fff;color:#000}header .sub{color:#444}}
+@media print{header .chips,header .btns,aside,#legend{display:none}header{background:#fff;color:#000}header .sub{color:#444}}
 </style>
 </head>
 <body>
@@ -839,16 +1143,19 @@ td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6
   </div>
 </header>
 <main>
+<div id="cvwrap">
 <svg id="cv" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <style>
-      .lk{stroke:#7d8b9a;stroke-width:2;fill:none}
-      .lk.hot{stroke:#1668c7;stroke-width:3}
+      .lk{fill:none}
       .lk.dim{opacity:.18}
       .pl rect{fill:#fff;stroke:#b9c3cf;stroke-width:1}
       .pl text{font:11px ui-monospace,Consolas,Menlo,monospace;fill:#27323e}
       .pl.hot rect{stroke:#1668c7;fill:#eaf2fc}
       .pl.dim{opacity:.15}
+      .ml rect{fill:#fff;stroke-width:1.4}
+      .ml text{font:600 10.5px "Segoe UI",system-ui,sans-serif;fill:#27323e}
+      .ml.dim{opacity:.15}
       .nd{cursor:pointer}
       .nd .card{fill:#fff;stroke:#c3ccd7;stroke-width:1.2}
       .nd.ghost .card{stroke-dasharray:5 4;fill:#f8f9fb}
@@ -865,6 +1172,8 @@ td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6
   <rect id="bg" x="0" y="0" width="100%" height="100%" fill="url(#dots)"/>
   <g id="root"><g id="gL"></g><g id="gP"></g><g id="gN"></g></g>
 </svg>
+<div id="legend"></div>
+</div>
 <aside><div id="side"></div></aside>
 </main>
 <script>const DATA = __DATA__;</script>
@@ -873,6 +1182,8 @@ td .t{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6
 'use strict';
 const NS='http://www.w3.org/2000/svg';
 const TYPES={switch:['Switches','Switch','#1668c7'],router:['Router/Firewalls','Router/Firewall','#7b46d6'],ap:['Access Points','Access Point','#0c8a5f'],phone:['Telefone','Telefon','#c56a00'],other:['Sonstige','Sonstiges','#66727f']};
+const MEDIA={lwl:['LWL (Glasfaser)','#e07c0c'],aoc:['AOC (aktives optisches Kabel)','#e07c0c'],dac:['DAC (Twinax)','#111827'],kupfer:['Kupfer (Twisted Pair)','#4f7396'],sfp:['SFP, Medium unbekannt','#8b5cf6'],bp:['Backplane','#0f766e'],'':['unbekannt','#9aa5b1']};
+const lw=function(s){return s>=25000?5:s>=10000?3.8:s>=2500?2.9:s>=1000?2.2:s>0?1.4:2;};
 const show={switch:true,router:true,ap:false,phone:false,other:false};
 const nodes=DATA.nodes,links=DATA.links,byId={};
 nodes.forEach(function(n){byId[n.id]=n;n.x=0;n.y=0;});
@@ -951,11 +1262,17 @@ function portLabel(p,q,text,cls){
   S('rect',{x:cx-w/2,y:cy-9.5,width:w,height:19,rx:9.5},g);
   S('text',{x:cx,y:cy+4,'text-anchor':'middle'},g,txt);
 }
-function drawLink(l,an){
-  const hot=selected&&(l.a===selected||l.b===selected),cls=hot?' hot':(selected?' dim':'');
-  S('line',{x1:an.a.x,y1:an.a.y,x2:an.b.x,y2:an.b.y,'class':'lk'+cls},gL);
+function drawLink(l,an,mid){
+  const hot=selected&&(l.a===selected||l.b===selected),cls=hot?' hot':(selected?' dim':''),m=MEDIA[l.media]||MEDIA[''];
+  S('line',{x1:an.a.x,y1:an.a.y,x2:an.b.x,y2:an.b.y,'class':'lk'+cls,stroke:m[1],'stroke-width':lw(l.speed)+(hot?1.2:0)},gL);
   portLabel(an.a,an.b,l.aPort,cls);
   portLabel(an.b,an.a,l.bPort,cls);
+  if(mid){
+    const w=mid.text.length*6.2+14,g=S('g',{'class':'ml'+cls},gP);
+    S('title',{},g,l.detail?mid.text+' ('+l.detail+')':mid.text);
+    S('rect',{x:mid.x-w/2,y:mid.y-8.5,width:w,height:17,rx:4,stroke:m[1]},g);
+    S('text',{x:mid.x,y:mid.y+3.8,'text-anchor':'middle'},g,mid.text);
+  }
 }
 function drawNode(n,nb){
   const s=sz(n),c=TYPES[n.type][2];
@@ -976,8 +1293,19 @@ function drawNode(n,nb){
 }
 function render(){
   gL.textContent='';gP.textContent='';gN.textContent='';
-  const vl=visLinks(),an=anchors(vl);
-  vl.forEach(function(l,i){drawLink(l,an[i]);});
+  const vl=visLinks(),an=anchors(vl),pairs={},mids=[];
+  vl.forEach(function(l,i){const k=l.a<l.b?l.a+'|'+l.b:l.b+'|'+l.a;(pairs[k]=pairs[k]||[]).push(i);});
+  const at=function(i,t){return {x:an[i].a.x+(an[i].b.x-an[i].a.x)*t,y:an[i].a.y+(an[i].b.y-an[i].a.y)*t};};
+  Object.keys(pairs).forEach(function(k){
+    const g=pairs[k],f=vl[g[0]];
+    if(g.every(function(i){return vl[i].label===f.label&&vl[i].media===f.media;})){
+      // gleiche parallele Links (LAG): eine gemeinsame Beschriftung
+      if(!f.label)return;
+      let x=0,y=0;g.forEach(function(i){const p=at(i,0.5);x+=p.x;y+=p.y;});
+      mids[g[0]]={x:x/g.length,y:y/g.length,text:(g.length>1?g.length+'\u00d7 ':'')+f.label};
+    }else g.forEach(function(i,j){if(vl[i].label){const p=at(i,0.5+(j-(g.length-1)/2)*0.2);mids[i]={x:p.x,y:p.y,text:vl[i].label};}});
+  });
+  vl.forEach(function(l,i){drawLink(l,an[i],mids[i]);});
   const nb=selected?neighbors(selected):new Set();
   nodes.filter(vis).forEach(function(n){drawNode(n,nb);});
 }
@@ -998,6 +1326,16 @@ function fit(){
 
 // --- Seitenleiste ---------------------------------------------------------
 function typeDot(parent,n){const i=H('span',{'class':'t'},parent);i.style.background=TYPES[n.type][2];return i;}
+function linkCell(tr,l){const c=H('td',{'class':'n'},tr);if(l.label){const i=H('span',{'class':'t'},c);i.style.background=(MEDIA[l.media]||MEDIA[''])[1];i.style.borderRadius='2px';c.appendChild(document.createTextNode(l.label));if(l.detail)c.title=l.detail;}return c;}
+function legend(){
+  const box=document.getElementById('legend'),vl=visLinks();box.textContent='';
+  const used={};vl.forEach(function(l){used[l.media||'']=true;});
+  ['lwl','aoc','dac','kupfer','sfp','bp',''].forEach(function(k){if(!used[k])return;const d=H('span',{},box),i=H('i',{},d);i.style.height='3px';i.style.background=MEDIA[k][1];d.appendChild(document.createTextNode(MEDIA[k][0]));});
+  const steps=[[100,'bis 100M',0,1000],[1000,'1G',1000,2500],[2500,'2.5G / 5G',2500,10000],[10000,'10G',10000,25000],[25000,'ab 25G',25000,1e12]].filter(function(s){return vl.some(function(l){return l.speed>0&&l.speed>=s[2]&&l.speed<s[3];});});
+  if(steps.length&&box.childNodes.length)H('span',{'class':'sep'},box);
+  steps.forEach(function(s){const d=H('span',{},box),e=H('i',{},d);e.style.height=lw(s[0])+'px';e.style.background='#5d6b78';d.appendChild(document.createTextNode(s[1]));});
+  box.style.display=box.childNodes.length?'':'none';
+}
 function select(id){selected=id;render();side();}
 function side(){
   const box=document.getElementById('side');box.textContent='';
@@ -1007,23 +1345,23 @@ function side(){
     const hd=H('div',{'class':'hd'},box);const d=H('span',{'class':'dot'},hd);d.style.background=TYPES[n.type][2];H('h2',{},hd,n.name);
     const dl=H('dl',{},box);
     [['IP',n.ip||'\u2013'],['Typ',TYPES[n.type][1]],['System',n.descr||'\u2013'],['Abfrage',n.scanned?'per SNMP ausgelesen':'nur per LLDP vom Nachbarn gemeldet']].forEach(function(r){H('dt',{},dl,r[0]);H('dd',{},dl,r[1]);});
-    const rows=links.filter(function(l){return l.a===n.id||l.b===n.id;}).map(function(l){return l.a===n.id?{p:l.aPort,o:byId[l.b],op:l.bPort}:{p:l.bPort,o:byId[l.a],op:l.aPort};}).sort(function(a,b){return nat(a.p,b.p);});
-    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Port','Nachbar','Nachbar-Port'].forEach(function(x){H('th',{},th,x);});
+    const rows=links.filter(function(l){return l.a===n.id||l.b===n.id;}).map(function(l){return l.a===n.id?{p:l.aPort,o:byId[l.b],op:l.bPort,l:l}:{p:l.bPort,o:byId[l.a],op:l.aPort,l:l};}).sort(function(a,b){return nat(a.p,b.p);});
+    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Port','Link','Nachbar','Nachbar-Port'].forEach(function(x){H('th',{},th,x);});
     const tb=H('tbody',{},t);
-    rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);const c=H('td',{'class':'n'},tr);typeDot(c,r.o);c.appendChild(document.createTextNode(r.o.name));H('td',{'class':'p'},tr,r.op);
+    rows.forEach(function(r){const tr=H('tr',{},tb);H('td',{'class':'p'},tr,r.p);linkCell(tr,r.l);const c=H('td',{'class':'n'},tr);typeDot(c,r.o);c.appendChild(document.createTextNode(r.o.name));H('td',{'class':'p'},tr,r.op);
       tr.onclick=function(){if(!show[r.o.type]){show[r.o.type]=true;chips();relayout();}select(r.o.id);};});
     if(!rows.length)H('p',{'class':'hint'},box,'Keine LLDP-Nachbarn.');
   }else{
     H('h2',{},box,'Verbindungen');
     H('p',{'class':'hint'},box,'Ger\u00e4t im Plan anklicken zeigt dessen Portbelegung. Knoten lassen sich verschieben.');
     const inp=H('input',{type:'search',placeholder:'Filtern nach Ger\u00e4t, IP oder Port \u2026'},box);inp.value=filter;
-    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Ger\u00e4t','Port','Port','Ger\u00e4t'].forEach(function(x){H('th',{},th,x);});
+    const t=H('table',{},box),th=H('tr',{},H('thead',{},t));['Ger\u00e4t','Port','Link','Port','Ger\u00e4t'].forEach(function(x){H('th',{},th,x);});
     const tb=H('tbody',{},t);
     const fill=function(){
       tb.textContent='';const f=filter.toLowerCase();
       visLinks().forEach(function(l){const A=byId[l.a],B=byId[l.b];
-        if(f&&[A.name,A.ip,l.aPort,l.bPort,B.name,B.ip].join(' ').toLowerCase().indexOf(f)<0)return;
-        const tr=H('tr',{},tb);let c=H('td',{'class':'n'},tr);typeDot(c,A);c.appendChild(document.createTextNode(A.name));H('td',{'class':'p'},tr,l.aPort);H('td',{'class':'p'},tr,l.bPort);c=H('td',{'class':'n'},tr);typeDot(c,B);c.appendChild(document.createTextNode(B.name));
+        if(f&&[A.name,A.ip,l.aPort,l.label,l.detail,l.bPort,B.name,B.ip].join(' ').toLowerCase().indexOf(f)<0)return;
+        const tr=H('tr',{},tb);let c=H('td',{'class':'n'},tr);typeDot(c,A);c.appendChild(document.createTextNode(A.name));H('td',{'class':'p'},tr,l.aPort);linkCell(tr,l);H('td',{'class':'p'},tr,l.bPort);c=H('td',{'class':'n'},tr);typeDot(c,B);c.appendChild(document.createTextNode(B.name));
         tr.onclick=function(){select(l.a);};});
     };
     inp.oninput=function(){filter=inp.value;fill();};fill();
@@ -1040,7 +1378,7 @@ function chips(){
     b.onclick=function(){show[t]=!show[t];if(selected&&!vis(byId[selected]))selected=null;chips();relayout();side();};
   });
 }
-function relayout(){layout();loadPos();render();fit();}
+function relayout(){legend();layout();loadPos();render();fit();}
 
 // --- Maus -----------------------------------------------------------------
 let drag=null;
@@ -1107,7 +1445,7 @@ $html = Join-Path $OutDir ($Name + '.html')
 $swLinks = @($linkRows | Where-Object { $_.TypB -eq 'Switch' -or $_.TypB -eq 'Router/Firewall' })
 Write-Host ''
 Write-Host ("{0} Geraete, {1} Verbindungen ({2} zwischen Switchen/Routern):" -f $nodeList.Count, $linkList.Count, $swLinks.Count)
-$swLinks | Format-Table GeraetA, PortA, PortB, GeraetB, GemeldetVon -AutoSize | Out-String -Width 200 | Write-Host
+$swLinks | Format-Table GeraetA, PortA, Link, PortB, GeraetB, GemeldetVon -AutoSize | Out-String -Width 200 | Write-Host
 Write-Host "Netzplan:  $html"
 Write-Host "draw.io:   $drawio"
 Write-Host "CSV:       $csvLinks"
